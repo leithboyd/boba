@@ -1,0 +1,7 @@
+# Project-wide settings (committed). Override per-machine in settings.local.toml (gitignored).
+#
+# Required for loading real market data (the test suite runs without it):
+#
+#   data_dir = "/path/to/holocron"
+#       Block-format parquet archive: holocron.{ts}.{idx}.{listing}.{data_type}.parquet
+#       Relative paths resolve against the project root; absolute paths are used as-is.

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "boba"
+version = "0.1.0"
+description = "boba"
+requires-python = ">=3.12"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/boba"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

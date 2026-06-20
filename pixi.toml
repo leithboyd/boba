@@ -1,0 +1,19 @@
+[workspace]
+authors = ["Leith McKendry <leith.mckendry@outlook.com>"]
+channels = ["conda-forge"]
+name = "boba"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+test = "pytest"
+
+[dependencies]
+python = "3.12.*"
+pytest = ">=9.0.3,<10"
+numpy = ">=2.0"
+polars = ">=1.0"
+scipy = ">=1.17.1,<2"
+
+[pypi-dependencies]
+boba = { path = ".", editable = true }
