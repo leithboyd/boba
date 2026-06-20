@@ -5,6 +5,21 @@ Data lives directly in DATA_DIR (no session sub-dirs), written in blocks:
 A "listing" is the full book token incl. the perp suffix, e.g. "bin_doge_usdt_p"
 (perp) or "bin_doge_usdt" (spot). A "block" is the "holocron.{ts}.{idx}" prefix —
 a contiguous ~24h chunk.
+
+Known data quirks (consumers beware):
+  * BBO (front_levels) cadence is venue-dependent. On eth_usdt_p, bin snapshots are
+    sub-millisecond, but byb/okx only refresh every ~10-20 ms (p90 100-160 ms) — so
+    byb/okx top-of-book is stale between snapshots. Fusing trade prints (hold the
+    newest-by-exchange_time price per side) gives a fresher *price-only* stream that
+    removes ~30-50% of byb/okx next-snapshot mid error, but hurts bin (its quote is
+    already fresher than its trades). Quantities stay snapshot-stale either way.
+    Holds across the archive on quiet and busy days — see
+    notebooks/02_merged_price_stream.ipynb.
+  * Binance perp (bin_*_p) `trade` streams carry ~0.25% rows with prc == 0 AND
+    qty == 0, at valid contiguous trade-ids. These are USD-M futures aggTrade
+    entries for insurance-fund / ADL fills, which Binance excludes from aggregation
+    (spot and byb/okx are clean). They are NOT market fills — filter `prc > 0`
+    (equivalently `qty > 0`) before any price/volume use.
 """
 from pathlib import Path
 from typing import Literal, Optional
