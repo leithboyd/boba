@@ -39,11 +39,9 @@ Claude can you suggest an eligant way to solve this issue? we want to calculate 
 > The agreed EMA event-clock design is written up in [ema_event_clock.md](ema_event_clock.md) (single merged clock, flow/level EMAs, rate/intensity/average decomposition, small-N handling).
 
 
+The features is going to be broken down into two sections base features and input features. The base features represent the state we need to maintain over time in order the calculate the input feature that are fead into the neural network. Input features also get normalised, base features do not uncless they are included raw in the input features section.
 
+For example base features `trade_event_rate_bin_eth_usdt_100t` and `trade_event_rate_bin_eth_usdt_1000t` could be used to add an event rate moment feature input feature by calculating `trade_event_rate_bin_eth_usdt_100t / trade_event_rate_bin_eth_usdt_1000t`
 
-
-
-
-
-
+When choosing to include features we are going to use stict feature hygine. 
 
