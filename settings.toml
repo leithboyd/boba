@@ -5,3 +5,10 @@
 #   data_dir = "/path/to/holocron"
 #       Block-format parquet archive: holocron.{ts}.{idx}.{listing}.{data_type}.parquet
 #       Relative paths resolve against the project root; absolute paths are used as-is.
+
+# Trade `aggressor` convention, per venue+market. A listing whose "{exchange}_{spot|perp}"
+# token appears here INVERTS the standard microstructure convention: there an
+# aggressor == "Bid" trade is a SELL (hits the bid) and "Ask" is a BUY (lifts the ask).
+# Everything else is standard ("Bid" = buy / lifts the ask). Default: Binance spot, which
+# is verified to invert it (Binance maps isBuyerMaker the other way for spot vs perp).
+aggressor_inverted = ["bin_spot"]
