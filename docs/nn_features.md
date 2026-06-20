@@ -29,7 +29,18 @@ IFeatureBuilder<TFeatures> {
 This implimentation/interface allows multiple event to be ingestested before emitting a feature set to predict on. This is important to allow all event data to be invested before emiting a set of features for prediction.
 
 
-The feature set is going to rely heavily on moving averages. So its important that we iron how how this is going to be done now before any feature development. instead of a basic average over a window we are going to use EMA's. The merged trade clock makes this a little complicated. If the clock was bin_trades and we wanted a evet trabed ema of trade volume over the last N events thats very simple. We just got an EMA with a fixed decay calculated using the event window size and thats that. the challange is when the event clock and the events your are aggregating using the ema are different. For example byb trade volume over the last N bin trade events. In this vase the implimentation should work as follows.
+The feature set is going to rely heavily on moving averages. So its important that we iron how how this is going to be done now before any feature development. instead of a basic average over a window we are going to use EMA's. The merged trade clock makes this a little complicated. If the clock was bin_trades and we wanted a evet trabed ema of trade volume over the last N events thats very simple. We just got an EMA with a fixed decay calculated using the event window size and thats that. the challange is when the event clock and the events your are aggregating using the ema are different. For example byb trade volume over the last N bin trade events. In this case the implimentation should functionally approximate the following logic.
+
+
+The event clock being differnt to the events being aggregated means that the number of events and hence the constant event ema decay factor are actually changing over time. on average at a large enough scale they should move together in a very consistant way since high trade activity on one exchnage should mean high activity on another. How ever at the micro scale they will probaly be much more disjointed. 
+
+Claude can you suggest an eligant way to solve this issue? we want to calculate things like event rate, volatility, volume using this methods at short event scales e.e. 10, 100 and large event scale e.g. 1000, 10000
+
+> The agreed EMA event-clock design is written up in [ema_event_clock.md](ema_event_clock.md) (single merged clock, flow/level EMAs, rate/intensity/average decomposition, small-N handling).
+
+
+
+
 
 
 
