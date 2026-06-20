@@ -18,6 +18,9 @@ build/
 settings.local.toml
 artifacts/
 
+# notebooks
+.ipynb_checkpoints/
+
 # environment / editor
 .env
 .venv/

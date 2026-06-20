@@ -4,6 +4,18 @@ channels = ["conda-forge"]
 name = "boba"
 platforms = ["osx-arm64"]
 version = "0.1.0"
+# Dependency-age policy: never resolve a conda package build that is younger than
+# 60 days (~2 months). Soak time avoids freshly-published, not-yet-shaken-out
+# releases and shrinks the supply-chain window. This is a *rolling* cutoff,
+# recomputed from "now" at every solve (`pixi lock`/`update`/`add`) — no date to
+# maintain. Enforced natively by pixi against each package's conda-build
+# timestamp; older-than-60d is always fine. To intentionally adopt something
+# newer, lower this value (or pin) and re-lock.
+# NOTE: this applies to conda packages only. The sole PyPI entry here is the
+# local editable `boba` (a path dep, exempt). If a real PyPI dependency is ever
+# added, set the PyPI-side equivalent too (pixi pypi-options exclude-newer) and
+# verify it against `pixi` docs for your version.
+exclude-newer = "60d"
 
 [tasks]
 test = "pytest"
@@ -17,3 +29,15 @@ scipy = ">=1.17.1,<2"
 
 [pypi-dependencies]
 boba = { path = ".", editable = true }
+
+# Notebook tooling lives in its own feature/environment so the default (test/CI)
+# env stays lean. Use it with:  pixi run -e notebook lab
+[feature.notebook.dependencies]
+jupyterlab = ">=4"
+matplotlib = ">=3.8"
+
+[feature.notebook.tasks]
+lab = "jupyter lab"
+
+[environments]
+notebook = ["notebook"]

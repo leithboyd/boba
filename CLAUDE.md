@@ -14,6 +14,21 @@ This project uses [pixi](https://pixi.sh) for environment and dependency managem
 - `pixi add <package>` — add a conda-forge dependency
 - `pixi run python ...` — run anything inside the environment
 
+## Dependency-age policy (≥ 60 days)
+
+`[workspace] exclude-newer = "60d"` in `pixi.toml` forbids resolving any conda
+package build younger than ~2 months. It's a *rolling* cutoff recomputed from
+"now" at every solve (`pixi lock` / `pixi update` / `pixi add`) and enforced
+natively by pixi against each package's conda-build timestamp — soak time that
+keeps freshly-published, not-yet-shaken-out releases (and a wider supply-chain
+window) out of the lock. Older-than-60d is always fine.
+
+Consequence: `pixi add`/`update` will pick the newest build that is already ≥60
+days old, not the latest. To intentionally adopt something newer, lower/remove
+`exclude-newer` (or pin the package) and re-lock. Applies to conda only; the lone
+PyPI entry is the editable local `boba` (a path dep, exempt). Add the PyPI-side
+equivalent if a real PyPI dependency is ever introduced.
+
 ## What this project does
 
 ETL for ML over crypto market microstructure data: builds a raw-atom feature matrix
