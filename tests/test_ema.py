@@ -4,7 +4,7 @@ import math
 import numpy as np
 from scipy.signal import lfilter
 
-from boba.ema import KernelMeanEMA
+from boba.ema import KernelMeanEMA, EventEMA, LiveFrontEMA
 
 
 def _ewma_ref(x, span):
@@ -81,3 +81,50 @@ def test_nan_before_first_event():
     for _ in range(5):
         f.tick()
     assert math.isnan(f.value())               # decaying nothing is still nothing
+
+
+def test_event_ema_matches_lfilter():
+    # the basic single-scalar EMA == standard lfilter (y[-1]=0 convention)
+    x = np.random.default_rng(2).standard_normal(3000)
+    span = 40
+    e = EventEMA(span)
+    out = []
+    for v in x:
+        e.step(v); out.append(e.value())
+    assert np.allclose(out, _ewma_ref(x, span), rtol=1e-12, atol=1e-12)
+    assert math.isnan(EventEMA(10).value())    # nan before first step
+
+
+def test_livefront_value_is_live_front():
+    # add() per book update only refreshes the front; tick() commits the value-at-trade into a plain
+    # EMA. value() = (1-a)*committed + a*latest, committed weighted by trades (not book-update churn).
+    a = 2.0 / 11.0
+    lf = LiveFrontEMA(10)
+    ref = EventEMA(10)                                       # reference committed engine
+    sched = [([1.0, 1.5], 1.5), ([2.0], 2.0), ([3.0, 2.8, 2.9], 2.9)]   # (book updates, value at trade)
+    for updates, vtrade in sched:
+        for u in updates:
+            lf.add(u)                                       # every book update
+        lf.tick()                                           # the trade commits the latest
+        ref.step(vtrade)
+    assert math.isclose(lf.value(), (1 - a) * ref.value() + a * 2.9, abs_tol=1e-12)
+
+
+def test_livefront_value_fresh_between_ticks():
+    a = 2.0 / 11.0
+    lf, ref = LiveFrontEMA(10), EventEMA(10)
+    for v in (1.0, 2.0, 3.0):
+        lf.add(v); lf.tick(); ref.step(v)
+    before = lf.value()
+    lf.add(9.0)                                             # a book update after the last trade (no tick)
+    assert lf.value() != before                            # read moved with fresh data...
+    assert math.isclose(lf.value(), (1 - a) * ref.value() + a * 9.0, abs_tol=1e-12)   # ...committed unchanged
+
+
+def test_livefront_is_drop_in_for_kernelmean():
+    # identical interface: tick(), add(value), value() work the same way on both
+    for cls in (KernelMeanEMA, LiveFrontEMA):
+        c = cls(10)
+        assert math.isnan(c.value())                       # nan before first commit
+        c.tick(); c.add(5.0); c.tick()
+        assert math.isfinite(c.value())
