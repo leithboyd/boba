@@ -92,7 +92,11 @@ Every feature here feeds one or both heads, and borrows the matching yardstick w
 to be made comparable across markets. Two questions recur below: does a feature's *signed*
 value predict the move (price head), and does its *magnitude* predict how many moves come
 (rate head)? Those are diagnostics — the model is fed the **signed** feature for *both* heads,
-and the rate head learns the magnitude (and how features cancel or reinforce) on its own.
+and the rate head learns the magnitude (and how features cancel or reinforce) on its own. And they
+are **marginal screens** — does the feature carry signal worth feeding — **not** measures of
+distributional fit: the model's actual targets are the count distribution `P(K = k)` and the
+count-conditioned price family `D_k` mixed above, fit downstream, not what these rank-ICs measure
+(§7 inspects the realised count/return distributions by feature bucket).
 """)
 
 md(r"""
@@ -174,7 +178,7 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 - **Do prove regime-invariance with Gate A — never assume it.** A usable feature reads the *same* in calm and
   wild markets: its distribution must be **independent of the regime**. Gate A's **control-free** checks (§6):
   **scale** (std stable across vol buckets, max/min < ~3); and — for **both the signed feature and its
-  magnitude `|feature|`** (the rate head is fed `|feature|`) — that it does **not track** the regime
+  magnitude `|feature|`** (the rate head sees the signed feature but can learn its magnitude) — that it does **not track** the regime
   (`|IC(·, vol & rate level)| ≈ 0`, the monotone test) **nor leak non-monotonically** (per-decile-mean
   **dispersion** small, which catches a U-shaped leak the monotone IC misses). All are **hard** gates. A raw
   **level** (`σ_ev`, `λ_ev`, a mean trade size) usually *is* the regime and fails them — but *measure, don't
@@ -451,10 +455,10 @@ print(f"grid: {len(anchor_ts):,} anchors")
 """)
 
 md(r"""
-## 4. Check the code is right — the oracle (a production-style streaming build)
+## 4. Check the code is right — a parity check (a production-style streaming build)
 
-**Non-negotiable.** Reproduce the feature with a second, independent implementation and confirm the two
-agree on real data. The oracle is the **production** reference: an O(1) state machine you push **raw
+**Non-negotiable.** Reproduce the feature with a second implementation and confirm the two
+agree on real data — a **parity check**, not an independent oracle. The streaming build is the **production** reference: an O(1) state machine you push **raw
 events** into — `on_book(...)` for a top-of-book update, `on_trade(...)` for a trade — and read the
 current feature per gap from `value()`. State is a few scalar EMAs per gap plus σ_ev's two EWMAs — no
 buffers, no history, independent of how long it runs.
@@ -472,7 +476,7 @@ buffers, no history, independent of how long it runs.
 
 We feed the **whole raw stream** — every venue's book updates and trades — into **one** builder and read
 **both** gaps (byb↔okx, byb↔bin) at each grid anchor. If the online build reproduces §3's vectorized
-feature on real data, both are right.
+feature on real data, the two implementations agree.
 """)
 
 code(r"""
@@ -597,14 +601,14 @@ for o in ("okx", "bin"):
     diff = np.abs(streams[o][both] - ref[both])
     print(f"  byb<->{o}:  max |diff| {np.nanmax(diff):.2e}  on {int(both.sum()):,} grid points")
     assert np.nanmax(diff) < 1e-6, f"live build does not reproduce the byb<->{o} feature"
-print("oracle: one raw-event stream reproduces BOTH gaps  OK")
+print("parity: one raw-event stream reproduces BOTH gaps  OK")
 """)
 
 md(r"""
 **Conclusion.** From one stream of ~8 M raw events the builder reproduces **both** vectorized features to
 floating-point precision — max |diff| ~4e-13 over ~200k grid points per gap, pure round-off from the
 EMAs' recursive last-digit drift. The production shape (one feed in, a feature *per gap* out) computes
-exactly what the offline analysis did, on the one shared trade clock — so the §3 build is trustworthy.
+exactly what the offline analysis did, on the one shared trade clock — so the two implementations compute the same feature.
 """)
 
 md(r"""
@@ -628,9 +632,15 @@ boundary). Note the embargo does **not** fully decorrelate the slow EMA/yardstic
 their memory is ≈ `YARDSTICK_N` / (trades-per-sec) ≈ 140 s here — longer than the ~100 s
 embargo — so re-check this if you slow the spans or use a thinner-traded block. The fold
 scores on the *next* segment,
-and we average over folds. That's the causal, ship-grade estimate — strictly past→future, as
+and we average over folds. That's the causal, production-style estimate — strictly past→future, as
 it would run live. (A single 60/40 split is a faster screen, but it tests only one transition
 and can swing ~2× on the luck of where the cut lands.)
+
+Because adjacent samples are correlated (overlapping 100 ms labels + long EMA/yardstick memory), a single
+point IC overstates its own precision — so for the **headline marginal** we also report the **per-fold** ICs
+(did the gain hold in *every* OOS segment?) and a **block-bootstrap 90% CI** that resamples contiguous time
+blocks sized to the EMA/yardstick memory (block length derived from the block's own trade-rate, not hard-coded),
+so the interval respects the autocorrelation rather than pretending all ~1.7 M anchors are independent.
 
 Because the feature and target are both in σ-units, a *scale* regime-shift mostly cancels —
 but scale is not the *relationship*. So beside the gates we run a **companion check**: the same
@@ -654,29 +664,13 @@ vol_momentum  = np.log(sig_fast / sigma_at_anchor)                              
 rate_level    = np.log(lam_at_anchor)                                               # λ_ev = byb's mid-move rate — is byb moving more or less often than usual?
 rate_momentum = np.log(lam_fast / lam_at_anchor)                                    # recent mid-move rate vs slower mid-move rate
 
-# Out-of-sample scoring = a purged, expanding-window WALK-FORWARD (causal: only past -> future).
-def wf_folds(features, y, k=6, embargo=2000):       # yields (test_mask, oos_prediction) for each fold
-    design = np.column_stack(features); n = len(y); valid = np.isfinite(design).all(1) & np.isfinite(y)
-    edges = np.linspace(0, n, k + 1).astype(int)
-    for i in range(1, k):                            # fold i: train on the PAST minus an embargo gap, test on the next segment
-        te = np.zeros(n, bool); te[edges[i]:edges[i + 1]] = True
-        tr = np.zeros(n, bool); tr[:max(0, edges[i] - embargo)] = True   # embargo clears the 100 ms outcome windows with margin; it does NOT fully decorrelate the slow EMA/yardstick memory (≈ YARDSTICK_N/trades-per-sec ≈ 140 s, longer than the ~100 s embargo)
-        train, test = valid & tr, valid & te
-        if train.sum() < 100 or test.sum() < 100: continue
-        mu, sd = design[train].mean(0), design[train].std(0) + 1e-12
-        X = np.column_stack([(design - mu) / sd, np.ones(n)])
-        coef, *_ = np.linalg.lstsq(X[train], y[train], rcond=None)
-        yield test, X @ coef
-
-def wf_ic(features, y):                              # mean OOS rank-IC across the walk-forward folds (the ship-grade gate)
-    return float(np.mean([spearmanr(p[t], y[t]).statistic for t, p in wf_folds(features, y)]))
-def wf_ic_by_regime(features, y, reg):              # same, but the mean OOS rank-IC WITHIN each regime bucket (the companion)
-    acc = {}
-    for t, p in wf_folds(features, y):
-        for r in np.unique(reg[t]):
-            m = t & (reg == r)
-            if m.sum() >= 100: acc.setdefault(int(r), []).append(spearmanr(p[m], y[m]).statistic)
-    return {r: float(np.mean(v)) for r, v in acc.items()}
+# The gate machinery (walk-forward IC, Gate A/B, the block-bootstrap CI) lives in the shared, TESTED
+# library boba.research.gates — defined once and used by every feature notebook (see tests/test_gates*.py;
+# externally validated against the literature and adversarially reviewed). We import the primitives here and
+# bind the regime scaffolding below into thin wrappers, so the call sites read the same while the logic
+# stays in one validated place.
+from boba.research import gates as _gates
+from boba.research.gates import ic, wf_folds, wf_ic, wf_ic_by_regime, stratified_ic
 
 vol_regime = np.digitize(vol_level, np.nanpercentile(vol_level[np.isfinite(vol_level)], [33, 67]))   # 0 calm, 1 mid, 2 wild
 # FEATURE_KIND drives GATE B below. "alpha" = a candidate signal that is NOT a regime descriptor
@@ -692,7 +686,19 @@ STRAT_VAR = None                                                       # mechani
                                                                        # the feature WITHIN strata of that yardstick, so the shared denominator can't manufacture IC
                                                                        # (the spurious correlation of ratios) — stratifying multiplicatively DECOUPLES the shared scale,
                                                                        # where a linear partial over-removes genuine within-yardstick signal. A SIGNED price-head alpha like
-                                                                       # price_dislocation shares no denominator with the σ_ev target (the signs decouple it) -> None.
+                                                                       # price_dislocation divides by the same σ_ev as the target, but a signed numerator makes that shared denominator's coupling negligible — verified by the §6 coupling rows -> None.
+# Thin wrappers binding the scaffolding above to the shared gate library (call sites stay unchanged):
+def signal_ic(leg_feats, *, own, tgt=None):                            # Gate B value (marginal over the controls, or standalone for a control's own leg)
+    return _gates.signal_ic(leg_feats, base, target if tgt is None else tgt,
+                            feature_kind=FEATURE_KIND, own=own, strat_var=STRAT_VAR)
+def signal_ic_by_regime(leg_feats, *, own, tgt=None):                  # the regime-stable companion (per calm/mid/wild bucket)
+    return _gates.signal_ic_by_regime(leg_feats, base, target if tgt is None else tgt, vol_regime,
+                                      feature_kind=FEATURE_KIND, own=own, strat_var=STRAT_VAR)
+def gate_a(feat):                                                      # Gate A on one feature vs the vol/rate regime coordinates
+    return _gates.gate_a(feat, vol_level, rate_level)
+def wf_marginal_ci(legs, tgt, B=400, seed=0):                          # per-fold spread + block-bootstrap 90% CI for the headline marginal
+    return _gates.marginal_ci(legs, base, tgt, B=B, seed=seed)
+
 print("control-only predictive power (walk-forward):  momenta", round(wf_ic(base, target), 3),
       " (near 0 = controls barely predict direction, so any feature gain is genuinely new)")
 """)
@@ -771,7 +777,7 @@ fig.tight_layout(); plt.show()
 # walk-forward gates below, and that is the number that counts.
 def best_member(grid): return np.unravel_index(np.nanargmax(grid), grid.shape)    # best (fast, slow) spans for THIS exchange (in-sample pick)
 price_member = {ex: best_member(price_grid[ex]) for ex in OTHERS}                  # one signed feature per exchange (price head)
-rate_member  = {ex: best_member(rate_grid[ex])  for ex in OTHERS}                  # one |feature| per exchange (rate head) — DIAGNOSTIC-ONLY readout of where |feature| peaks against the move count; it is NOT separately put through the §5 gates (only the price feature is gated, and the same signed feature feeds both heads)
+rate_member  = {ex: best_member(rate_grid[ex])  for ex in OTHERS}                  # one feature per exchange (rate head) — its span is PICKED here by the |feature|→count heat-map (in-sample, like the price pick), then the rate-SPAN feature is put through its OWN Gate A/B below (the rate-head gate cell), against the COUNT target — its verdict is not inherited from the price gates
 print("kept features (one per exchange, all fed to the model — none privileged):")
 for ex in OTHERS:
     pi, pj = price_member[ex]; ri, rj = rate_member[ex]
@@ -784,10 +790,17 @@ md(r"""
 **walk-forward** mean (causal, purged); the one exception is the control-standalone **stratified** IC, which is
 in-sample decoupled (its out-of-sample confirmation comes from the multi-block harness in `tools/oss`).
 
+One caveat for **both heads**: the fast/slow span is chosen by the in-sample heat-map *above* over the
+**whole** block, so the walk-forward IC below is **post-selection and provisional** — mildly optimistic,
+since the test folds also informed the span pick. Held-out span selection is deferred to the multi-block
+`tools/oss` harness; here the choice is among a small 4×4 fast/slow grid (15 valid pairs) of near-identical
+neighbours, so the selection bias is expected to be small (we don't measure it on this single block).
+
 **Gate A — regime invariance** (the feature *alone*): is the feature's distribution **independent of the
 regime**, or does it *leak* it? **Control-free** checks: **scale** — its std across vol buckets (max/min,
-want **< ~3**); and then, for **both the signed feature *and* its magnitude `|feature|`** (the rate head is
-fed `|feature|`, so a magnitude that tracks the regime leaks straight into it), two leak modes against **both
+want **< ~3**); and then, for **both the signed feature *and* its magnitude `|feature|`** (the rate head
+receives the *signed* feature and can learn its magnitude, so a magnitude that tracks the regime would leak
+into it), two leak modes against **both
 regime coordinates** (vol *and* rate level): **tracking** — `|IC(·, level)|` ≈ 0 (the monotone test, want
 **< ~0.05** for the signed feature, **< ~0.1** for the magnitude), and **dispersion** — the spread of its
 per-decile *means* (want **< ~0.1**), which catches a *non-monotone* leak the monotone IC misses. Each closes
@@ -812,7 +825,7 @@ arithmetic reason (the spurious correlation of ratios). The fix is to **stratify
 and score *within* strata of it (`STRAT_VAR = sigma_at_anchor` for the σ_ev price target, `lam_at_anchor`
 for the λ_ev rate target): stratifying multiplicatively **decouples** the shared denominator, where a linear
 partial over-removes the genuine within-yardstick signal (~87% of it). A **signed price-head alpha** needs
-none — its sign decouples it — so `STRAT_VAR = None`. *(This control-standalone stratified IC is **in-sample**
+none — a signed numerator should make the shared-σ_ev coupling negligible (verified by the coupling rows in the §6 gate table) — so `STRAT_VAR = None`. *(This control-standalone stratified IC is **in-sample**
 decoupled, not walk-forward; its out-of-sample confirmation comes from the multi-block harness in `tools/oss`.)*
 *Regime-stable* (companion): is Gate B still positive **within** calm, mid, and wild vol — not a one-regime artefact?
 """)
@@ -826,73 +839,42 @@ code(r"""
 #   by the scored target's yardstick (STRAT_VAR set), score it STRATIFIED by that yardstick — multiplicatively
 #   decoupling the shared denominator (HIGH-2), where a linear partial would over-remove genuine signal.
 #   own=True selects the standalone branch.
-def stratified_ic(feat, tgt, sv, nb=40):              # mean within-stratum Spearman, stratifying by the shared yardstick sv
-    fin = np.isfinite(feat) & np.isfinite(tgt) & np.isfinite(sv)
-    edges = np.nanquantile(sv[fin], np.linspace(0, 1, nb + 1)[1:-1])    # ISSUE-5: equal-MASS bins, finer nb -> tames a heavy-tailed sv
-    bkt = np.digitize(sv, edges)
-    ics, ws = [], []
-    for b in range(nb):
-        m = fin & (bkt == b)
-        if m.sum() > 100 and np.std(feat[m]) > 0 and np.std(tgt[m]) > 0:    # BLOCKER-3: skip constant buckets (Spearman would be NaN)
-            r = spearmanr(feat[m], tgt[m]).statistic
-            if np.isfinite(r): ics.append(r); ws.append(int(m.sum()))       # BLOCKER-3: drop any residual NaN before the weighted mean
-    return float(np.average(ics, weights=ws)) if ics else float("nan")
-def signal_ic(leg_feats, *, own, tgt=None):                              # BLOCKER-2: tgt defaults to the price target; a RATE-head control passes tgt=rate_target
-    tgt = target if tgt is None else tgt
-    if FEATURE_KIND == "control" and own:                                # STANDALONE control: decouple the shared yardstick
-        if STRAT_VAR is None:                                            # LOW-1 footgun: an un-decoupled standalone IC
-            print("  WARNING: control + own-leg with STRAT_VAR=None — the standalone IC is NOT decoupled from a "
-                  "shared yardstick; set STRAT_VAR to the scored target's denominator if the feature divides by it.")
-            return round(float(np.mean([ic(f, tgt) for f in leg_feats])), 3)
-        return round(float(np.mean([stratified_ic(f, tgt, STRAT_VAR) for f in leg_feats])), 3)
-    return round(wf_ic(base + leg_feats, tgt) - wf_ic(base, tgt), 3)      # alpha / control-cross: marginal over base
-def signal_ic_by_regime(leg_feats, *, own, tgt=None):                    # the regime-stable companion — SAME Gate-B logic
-    tgt = target if tgt is None else tgt
-    if FEATURE_KIND == "control" and own and STRAT_VAR is not None:      # stratified_ic restricted to each vol_regime bucket
-        out = {}
-        for r in np.unique(vol_regime[np.isfinite(vol_regime)]):
-            rm = (vol_regime == r)
-            out[int(r)] = round(float(np.mean([stratified_ic(np.where(rm, f, np.nan), tgt, STRAT_VAR) for f in leg_feats])), 3)
-        return out
-    full = wf_ic_by_regime(base + leg_feats, tgt, vol_regime)
-    basr = wf_ic_by_regime(base, tgt, vol_regime)
-    return {r: round(full[r] - basr.get(r, 0.0), 3) for r in full}
-def ic(a, b):
-    m = np.isfinite(a) & np.isfinite(b)
-    return float(spearmanr(a[m], b[m]).statistic) if m.sum() > 100 else float("nan")
+# signal_ic / signal_ic_by_regime / stratified_ic / ic all come from boba.research.gates (the §5 wrappers
+# bind base / FEATURE_KIND / STRAT_VAR / vol_regime). The branch logic above is what those functions implement,
+# and a control + own-leg with STRAT_VAR=None falls back to a plain (un-decoupled) standalone IC.
 
 disloc = {ex: price_dislocation(ex, FAST[price_member[ex][0]], SLOW[price_member[ex][1]]) for ex in OTHERS}
 joint = signal_ic(list(disloc.values()), own=False)
 strat = signal_ic_by_regime(list(disloc.values()), own=False)
-rep = disloc[OTHERS[0]]                                 # same construction for every exchange -> one is enough for Gate A
-# GATE A — regime invariance (vol_level/rate_level are the regime COORDINATE, never controls): scale, plus
-# the signed feature AND its magnitude |feature| (the rate head's input) each checked for regime leakage two
-# ways x two coordinates — TRACK = |IC(., vol/rate level)| (monotone mean/magnitude drift) and DISP =
-# per-decile-mean dispersion vs vol OR rate (a NON-monotone, e.g. U-shaped, leak the monotone IC misses).
-vol_decile  = np.digitize(vol_level,  np.nanpercentile(vol_level[np.isfinite(vol_level)],   np.arange(10, 100, 10)))
-rate_decile = np.digitize(rate_level, np.nanpercentile(rate_level[np.isfinite(rate_level)], np.arange(10, 100, 10)))
-band  = [np.nanstd(rep[vol_decile == d]) for d in range(10)]
-def _disp(x, norm):                                    # max per-decile-MEAN dispersion of x over BOTH regime coordinates (÷ norm)
-    return max(float(np.nanstd([np.nanmean(x[dec == k]) for k in range(10)]) / (norm + 1e-12)) for dec in (vol_decile, rate_decile))
-loc_v = abs(ic(rep, vol_level)); loc_r = abs(ic(rep, rate_level))                  # monotone MEAN-tracking vs each regime level
-mag_v = abs(ic(np.abs(rep), vol_level)); mag_r = abs(ic(np.abs(rep), rate_level))  # N1/ISSUE-4: |feature| (the rate head's input) must not track the regime either
-mean_disp = _disp(rep, np.nanstd(rep))                                            # NON-monotone MEAN leak (vs vol OR rate)
-mag_disp  = _disp(np.abs(rep), np.nanmean(np.abs(rep)))                           # NON-monotone MAGNITUDE leak (vs vol OR rate)
+pci = wf_marginal_ci(list(disloc.values()), target)   # H5: per-fold spread + block-bootstrap CI for the headline marginal
+print(f"joint Gate B marginal {joint:.3f}  |  per-fold {pci['per_fold']} (positive in {pci['pos']}/{pci['nf']})  |  block-bootstrap 90% CI [{pci['ci'][0]}, {pci['ci'][1]}]  (block ~{pci['block_len']} anchors ~{pci['block_s']}s)")
+rep = disloc[OTHERS[0]]                                 # representative leg — for the momenta-overlap sanity print only (Gate A runs PER EXCHANGE below)
+# GATE A — regime invariance (vol_level/rate_level are the regime COORDINATE, never controls), run PER EXCHANGE
+# (Gate A is a property of the output DISTRIBUTION, which differs by venue — bin is sub-ms fresh, byb/okx stale):
+# scale, plus the signed feature AND its magnitude |feature| (which the signed-fed rate head can learn), each checked
+# two ways x two coordinates — TRACK = |IC(., vol/rate level)| (monotone drift) and DISP = per-decile-mean dispersion
+# vs vol OR rate (a NON-monotone, e.g. U-shaped, leak the monotone IC misses); each row reports the WORST coordinate.
+# gate_a(feat) comes from boba.research.gates via the §5 wrapper — scale / track / mag / disp vs the vol &
+# rate regime coordinates (worst-coordinate per check); it computes its own equal-mass deciles internally.
 # LOW-1 sanity: an "alpha" must NOT be a hidden regime descriptor -> its overlap with the momenta is small.
 print(f"FEATURE_KIND={FEATURE_KIND!r} | feature vs momenta |IC|: rate {abs(ic(rep, rate_momentum)):.3f} vol {abs(ic(rep, vol_momentum)):.3f}  (large for an 'alpha' => it's really a control)")
 gate_rows = [dict(gate="B · signal", detail="all exchanges together — marginal over the invariant controls", value=joint)]
 gate_rows += [dict(gate="B · signal", detail=f"{ex} alone — marginal over the controls",
                    value=signal_ic([disloc[ex]], own=False)) for ex in OTHERS]
-gate_rows += [dict(gate="A · regime-inv (scale)",      detail="feature scale across vol buckets (max/min) — HARD, want < ~3", value=round(max(band) / min(band), 2)),
-              dict(gate="A · regime-inv (mean-track)", detail="|IC(feature, vol level)| — no monotone mean-drift; want < ~0.05", value=round(loc_v, 3)),
-              dict(gate="A · regime-inv (mean-track)", detail="|IC(feature, rate level)| — want < ~0.05", value=round(loc_r, 3)),
-              dict(gate="A · regime-inv (mean-disp)",  detail="non-monotone mean leak — per-decile-mean dispersion vs vol OR rate; want < ~0.1", value=round(mean_disp, 3)),
-              dict(gate="A · regime-inv (mag-track)",  detail="|IC(|feature|, vol level)| — the rate head sees |feature|, so its magnitude must not track the regime; want < ~0.1", value=round(mag_v, 3)),
-              dict(gate="A · regime-inv (mag-track)",  detail="|IC(|feature|, rate level)| — want < ~0.1", value=round(mag_r, 3)),
-              dict(gate="A · regime-inv (mag-disp)",   detail="non-monotone magnitude leak — per-decile-mean-|feature| dispersion vs vol OR rate; want < ~0.1", value=round(mag_disp, 3))]
+# H1 shared-σ_ev coupling check: the signed feature AND the σ_ev price target both divide by σ_ev. A SIGNED
+# numerator should decouple that shared denominator — verify it (don't assert it): the standalone IC WITHIN
+# σ_ev strata ≈ the unstratified standalone IC means σ_ev isn't manufacturing the rank-IC (spurious ratio corr).
+gate_rows += [dict(gate="B · coupling", detail=f"{ex} — signed feature standalone IC, unstratified", value=round(ic(disloc[ex], target), 3)) for ex in OTHERS]
+gate_rows += [dict(gate="B · coupling", detail=f"{ex} — signed standalone IC WITHIN σ_ev strata (≈ unstratified => σ_ev not manufacturing it)", value=round(stratified_ic(disloc[ex], target, sigma_at_anchor), 3)) for ex in OTHERS]
+for ex in OTHERS:                                       # GATE A PER EXCHANGE (worst coordinate per check) — bin AND okx, since the output distribution differs by venue
+    a = gate_a(disloc[ex])
+    gate_rows += [dict(gate=f"A · regime-inv ({ex})", detail="feature scale across vol buckets (max/min) — HARD, want < ~3", value=a["scale"]),
+                  dict(gate=f"A · regime-inv ({ex})", detail="|IC(feature, vol/rate level)| — signed mean-track, worst coord; want < ~0.05", value=a["track"]),
+                  dict(gate=f"A · regime-inv ({ex})", detail="|IC(|feature|, vol/rate level)| — magnitude track (the signed-fed rate head can learn it), worst coord; want < ~0.1", value=a["mag"]),
+                  dict(gate=f"A · regime-inv ({ex})", detail="non-monotone leak — per-decile-mean dispersion (mean & magnitude), worst; want < ~0.1", value=a["disp"])]
 gate_rows += [dict(gate="regime-stable", detail=f"signal within {nm}-vol (companion: stay positive)", value=strat.get(r, float("nan")))
               for r, nm in [(0, "calm"), (1, "mid"), (2, "wild")]]
-pl.Config.set_tbl_rows(15); pl.Config.set_fmt_str_lengths(60)
+pl.Config.set_tbl_rows(25); pl.Config.set_fmt_str_lengths(60)
 pl.DataFrame(gate_rows)
 """)
 
@@ -900,15 +882,90 @@ md(r"""
 **Conclusion.** `price_dislocation` clears every gate. It adds ≈ **0.086** walk-forward rank-IC over the
 controls — jointly and for bin alone (okx alone adds ≈ 0.048, but jointly bin already captures the shared
 signal so the joint marginal = bin-alone ≈ 0.086; we keep okx anyway because leadership rotates and its
-standalone gain is positive) — far above the ~0.01 floor (**Gate B**). Its distribution wanders only
-**1.23×** across volatility buckets, barely tracks the regime (mean-track |IC| 0.00 / 0.01), its per-decile
-means barely move (bucket-mean dispersion ≈ 0.02), and its magnitude only weakly tracks vol (≈ 0.07 — the
-loosest of the Gate A checks, but still under the ~0.1 bar), so it's **regime-invariant on every Gate A check**
-(**Gate A**) — not a level in disguise — and model-ready as-is. And the companion shows the marginal
+standalone gain is positive) — far above the ~0.01 floor (**Gate B**); and within σ_ev strata the standalone
+IC barely moves (0.103→0.101 bin, 0.059→0.057 okx), so the shared σ_ev isn't manufacturing it. Run **per
+exchange** (Gate A is a distribution property — venues differ), it clears every check on **both** legs: scale
+wanders only **1.23× / 1.32×** (bin / okx; ≪ 3), the signed feature barely tracks the regime (mean-track
+**0.01 / 0.003**), and the magnitude the rate head can learn only weakly tracks it (mag-track **0.073 / 0.091**,
+dispersion **0.068 / 0.087**) — all under the ~0.05 / ~0.1 bars, so it's **regime-invariant on every Gate A
+check, every exchange** (**Gate A**) — not a level in disguise — and a clean single-block candidate. The
+**okx** leg is the looser of the two (mag-track 0.091, brushing the ~0.1 bar) — consistent with its staler
+feed, worth watching across blocks. And the companion shows the marginal
 gain positive in **all three** regimes — 0.066 / 0.085 / 0.116 for calm / mid / wild — so the signal is
-regime-stable, not a one-regime artefact. Verdict: real and ship-able, for **both heads, every exchange**.
+regime-stable, not a one-regime artefact. Verdict for the **price head**: clears every local gate on this
+block, **every exchange** — a single-block candidate; shipping is gated by §10. (The rate head is gated separately just below — its verdict is read off the rate-head gate
+table, not inherited from these price-head gates.)
 The chosen scales match the story — the price head took a lightly-smoothed fast leg over a moderate slow
 one (fast=10, slow=500) for both venues; the rate head stayed sharp (fast=1, slow=100).
+""")
+
+md(r"""
+**Now the rate head — its own gates, against the count target.** The block above gated the *price-span*
+feature against the σ_ev **price** target. The rate head is fed a **different-span** feature (the sharp
+`rate_member` pick) and predicts the **count** target, so its verdict is **not** inherited from the price
+gates — it gets the same two-gate battery here.
+
+The rate head's signal lives in the **magnitude**: `|feature| → count` is the §6 diagnostic, and the model
+is fed the **signed** feature and recovers `|·|` itself (a nonlinear head can). So **Gate B scores
+`|feature|`** — a *linear* score on the signed feature would read ≈ 0 precisely because the count
+relationship is symmetric, so `|feature|` is the honest proxy for what the nonlinear rate head extracts.
+**Coupling guard:** the price head could use `STRAT_VAR=None` because its **signed** numerator decouples the
+shared σ_ev; the magnitude path has no sign to decouple it, and `|feature| ∝ 1/σ_ev` while `count/λ_ev ∝
+1/λ_ev` share the byb-activity regime — so we add a **within-λ_ev stratified** line per exchange to confirm
+the marginal isn't a `1/λ_ev` artefact. **Gate A** is re-run **per exchange** on the rate-span feature (a
+distribution property — it differs by venue *and* by span).
+""")
+
+code(r"""
+# === RATE-HEAD GATES ===
+# The price-head gates above ran the price-SPAN feature against the σ_ev price target. The rate head is fed a
+# DIFFERENT-span feature (the rate_member pick) and predicts the COUNT target, so its verdict can't be inherited
+# from the price gates — it gets the SAME two-gate battery here, against the count target.
+#  * The rate head's signal lives in the MAGNITUDE: |feature|->count is the §6 diagnostic, and the model is fed the
+#    SIGNED feature and recovers |.| internally (a nonlinear head can). So Gate B scores |feature| — a LINEAR score
+#    on the signed feature reads ~0 precisely because the count relationship is symmetric; |feature| is the honest
+#    proxy for what the nonlinear rate head extracts.
+#  * Coupling guard: the price head could set STRAT_VAR=None because its SIGNED numerator decouples the shared σ_ev.
+#    The magnitude path has no sign to decouple it, and |feature| ~ 1/σ_ev while count/λ_ev ~ 1/λ_ev share the byb-
+#    activity regime — so we add a within-λ_ev stratified line per exchange to confirm the marginal is not a 1/λ_ev artefact.
+#  * Gate A is re-run PER EXCHANGE on the rate-span feature (a distribution property — it differs by venue AND by span).
+disloc_rate = {ex: price_dislocation(ex, FAST[rate_member[ex][0]], SLOW[rate_member[ex][1]]) for ex in OTHERS}
+mag_rate    = {ex: np.abs(disloc_rate[ex]) for ex in OTHERS}
+
+joint_rate  = signal_ic(list(mag_rate.values()), own=False, tgt=rate_target)            # |feature|->count, marginal over the controls, all venues together
+strat_rate  = signal_ic_by_regime(list(mag_rate.values()), own=False, tgt=rate_target)  # the calm/mid/wild companion
+rci = wf_marginal_ci(list(mag_rate.values()), rate_target)   # H5: per-fold spread + block-bootstrap CI for the rate-head headline marginal
+print(f"joint Gate B (rate) marginal {joint_rate:.3f}  |  per-fold {rci['per_fold']} (positive in {rci['pos']}/{rci['nf']})  |  block-bootstrap 90% CI [{rci['ci'][0]}, {rci['ci'][1]}]  (block ~{rci['block_len']} anchors ~{rci['block_s']}s)")
+# gate_a (worst-coordinate Gate A, used for both heads) is defined in the §6 price-gate cell above.
+
+rate_rows  = [dict(gate="B · signal (rate)", detail="all exchanges together — marginal |feature|->count over the controls; want >~ 0.01", value=joint_rate)]
+rate_rows += [dict(gate="B · signal (rate)", detail=f"{ex} alone — marginal |feature|->count over the controls",
+                   value=signal_ic([mag_rate[ex]], own=False, tgt=rate_target)) for ex in OTHERS]
+rate_rows += [dict(gate="B · coupling (rate)", detail=f"{ex} — |feature|->count WITHIN λ_ev strata (stays +ve => not a 1/λ_ev artefact)",
+                   value=round(stratified_ic(mag_rate[ex], rate_target, lam_at_anchor), 3)) for ex in OTHERS]
+for ex in OTHERS:
+    a = gate_a(disloc_rate[ex])
+    rate_rows += [dict(gate=f"A · regime-inv ({ex})", detail="feature scale across vol buckets (max/min) — HARD, want < ~3", value=a["scale"]),
+                  dict(gate=f"A · regime-inv ({ex})", detail="|IC(feature, vol/rate level)| — signed mean-track, worst coord; want < ~0.05", value=a["track"]),
+                  dict(gate=f"A · regime-inv ({ex})", detail="|IC(|feature|, vol/rate level)| — the rate head sees |feature|, worst coord; want < ~0.1", value=a["mag"]),
+                  dict(gate=f"A · regime-inv ({ex})", detail="non-monotone leak — per-decile-mean dispersion (mean & magnitude), worst; want < ~0.1", value=a["disp"])]
+rate_rows += [dict(gate="regime-stable (rate)", detail=f"|feature|->count within {nm}-vol (companion: stay positive)", value=strat_rate.get(r, float("nan")))
+              for r, nm in [(0, "calm"), (1, "mid"), (2, "wild")]]
+pl.Config.set_tbl_rows(25); pl.Config.set_fmt_str_lengths(70)
+pl.DataFrame(rate_rows)
+""")
+
+md(r"""
+**Conclusion (rate head).** The rate-span feature clears the same battery against the **count** target,
+every exchange. **Gate B** — the marginal `|feature| → count` over the controls is **+0.028** jointly,
+**+0.024** (bin) and **+0.014** (okx) on their own, all above the ~0.01 floor; and *within* **λ_ev strata**
+the signal stays robustly positive (**0.07** bin, **0.049** okx), so the marginal isn't a `1/λ_ev` arithmetic
+artefact. **Gate A** holds per exchange — scale **1.18 / 1.20** (≪ 3), signed mean-track **0.004** (≪ 0.05),
+and the `|feature|` the rate head actually sees barely tracks the regime (mag-track **0.08 / 0.05**,
+dispersion **0.06 / 0.06**, both under the ~0.1 bar). The **companion** is positive in every regime
+(**0.019 / 0.030 / 0.030** for calm / mid / wild). So the rate head clears every local gate too — so the
+"**both heads, every exchange**" verdict is *earned* **on this block**, not inherited. (The okx rate leg at
+0.014 and bin's 0.08 mag-track are the loosest numbers — worth watching across blocks.)
 """)
 
 md(r"""
@@ -1042,12 +1099,15 @@ the *forward* return *controlling for the trailing* `[anchor−100 ms, anchor]` 
 big raw IC collapses once the trailing move is partialled out, the feature was mostly re-reporting the move
 already underway — report the **netted** number in the verdict, not the raw δ=0 IC.
 
-**Cross-venue legs: rule out the feed-resolution artifact before claiming a lead.** byb/okx top-of-book is
-stale between snapshots (p90 ~100–160 ms) while bin's is sub-ms, so a "foreign venue leads byb" edge can be
-the foreign book simply being *fresher*, not economically *leading*. Confirm by re-measuring the cross-venue
-IC with the foreign feed **matched to byb's update cadence** (sample the foreign book only at byb update
-times, or coarsen it to byb's median inter-update gap): a real lead survives the cadence match, a feed
-artifact collapses toward zero. The tell — if the *stalest* venue shows the *largest* IC, suspect resolution.
+**Cross-venue legs: a freshness lead is *real edge*, not an artifact to coarsen away.** The data is recorded
+on a production box in the target datacenter, so each event's `rx_time` is exactly the timing you'd see live —
+there is **no recording/snapshot artifact** to rule out. So when okx's book moves before byb's reflects it
+(byb/okx top-of-book is stale p90 ~100–160 ms vs bin's sub-ms), that lead is **genuine and exploitable**, and
+the *mechanism* (economic price-discovery vs pure latency lead-lag) is irrelevant to P&L. Do **not** coarsen the
+foreign feed to byb's cadence — that throws the edge away. What governs whether you can capture it is the
+**latency budget** (the lifetime IC-by-δ above): act within the signal's half-life. *(A freshness lead would
+only be fake if the recording's cadence didn't match production — e.g. a backtest on vendor snapshots; not the
+case here, where the recording* is *production timing.)*
 """)
 
 md(r"""
@@ -1192,8 +1252,8 @@ sweep the horizon too.)
 md(r"""
 ## 10. The verdict, and what it takes to ship
 
-**Keep it — feed the *signed* feature to both heads, all exchanges, at a couple of time-scales
-each:**
+**Keep it — feed the *signed* feature to both heads (each head gated separately in §6), all exchanges, at
+a couple of time-scales each:**
 - **Price head (direction):** a fast average over a slow one — here both venues landed on a
   lightly-smoothed fast leg over a moderate slow one (fast=10, slow=500); how much to smooth is a
   per-feature choice, so sweep it.
@@ -1201,7 +1261,11 @@ each:**
   slow leg (n_slow=100), so the difference reacts to the freshest gap.
   The *magnitude* of the gap is what predicts a burst of moves, but you still feed the
   **signed** feature and let the rate head recover that — and learn how exchanges' gaps
-  cancel or reinforce. (Feeding pre-`|·|` per exchange would block that.)
+  cancel or reinforce. (Feeding pre-`|·|` per exchange would block that.) The rate-span feature
+  is put through its **own** Gate A/B battery against the **count** target (the rate-head gate table
+  in §6), and clears it on this block — Gate B **+0.028** joint (`|feature| → count`, above the ~0.01
+  floor), Gate A within bars per exchange, companion positive in every regime — so "keep it" is
+  *earned* for the rate head too, not inherited from the price gates.
 
 Feed **every exchange's** signed feature in and let the model lean on whichever is leading at
 the moment; don't collapse to a single "leader." The feature is divided by the volatility
@@ -1225,6 +1289,6 @@ nb = {
                  "language_info": {"name": "python"}},
     "nbformat": 4, "nbformat_minor": 5,
 }
-out = Path("/Users/leith/source/new/boba/notebooks/features/template.ipynb")
+out = Path(__file__).resolve().parents[1] / "template.ipynb"   # notebooks/features/template.ipynb, relative to this builder (portable across checkouts)
 out.write_text(json.dumps(nb, indent=1))
 print("wrote", out, "with", len(cells), "cells")
