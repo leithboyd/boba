@@ -27,3 +27,7 @@ artifacts/
 .vscode/
 .idea/
 .DS_Store
+
+# OOS harness cache (regenerable, large)
+tools/oss/cache/
+tools/oss/run.log
