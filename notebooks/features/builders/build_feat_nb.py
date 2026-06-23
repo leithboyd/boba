@@ -171,13 +171,23 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 - **Do score out-of-sample** with a purged, embargoed walk-forward (strictly past→future) — a single split is only a faster screen.
 - **Do use the freshest valid price per exchange.**
 - **Do treat a feature as a family across time-scales** and let the data assign scales to heads.
-- **Do prove regime-invariance with the scale gate — never assume it.** A usable feature reads the
-  *same* in calm and wild markets; the test is its **measured scale across volatility buckets** (§5's
-  normaliser), and that is a **hard** gate. A raw **level** (`σ_ev`, `λ_ev`, a mean trade size) usually
-  *is* the regime and fails it — but *measure, don't assume*: a **ratio / bounded / normalised** form
-  may pass, and even a ratio of two non-invariant levels can be invariant when they co-move. Never call
-  a feature regime-invariant *or* not — nor a level useless — until its scale number says so. (Corollary:
-  don't assert *any* property — invariance, a lead/lag, "it's circular" — you haven't measured on a real block.)
+- **Do prove regime-invariance with Gate A — never assume it.** A usable feature reads the *same* in calm and
+  wild markets: its distribution must be **independent of the regime**. Gate A's **control-free** checks (§6):
+  **scale** (std stable across vol buckets, max/min < ~3); and — for **both the signed feature and its
+  magnitude `|feature|`** (the rate head is fed `|feature|`) — that it does **not track** the regime
+  (`|IC(·, vol & rate level)| ≈ 0`, the monotone test) **nor leak non-monotonically** (per-decile-mean
+  **dispersion** small, which catches a U-shaped leak the monotone IC misses). All are **hard** gates. A raw
+  **level** (`σ_ev`, `λ_ev`, a mean trade size) usually *is* the regime and fails them — but *measure, don't
+  assume*: a **ratio / bounded / normalised** form may pass, and even a ratio of two non-invariant levels can
+  be invariant when they co-move. Never call a feature regime-invariant *or* not — nor a level useless — until
+  **every** Gate A number says so. (Corollary: don't assert *any* property — invariance, a lead/lag, "it's
+  circular" — you haven't measured on a real block.)
+- **Don't fuse the two gates — they're independent.** *Regime invariance* (Gate A) is the feature's own
+  distribution being stable across regimes; *signal* (Gate B) is what it predicts over the **invariant**
+  controls. The raw vol/rate **levels are never controls** (they aren't valid features) — putting them in
+  the signal test just smuggles the regime test back in. And **a control can be a valid feature**: when the
+  feature under test *is* a regime descriptor, marginal-over-its-own-controls is circular — judge it on its
+  **standalone** signal, and never call it "redundant" from its algebra alone.
 """)
 
 md(r"""
@@ -600,13 +610,15 @@ exactly what the offline analysis did, on the one shared trade clock — so the 
 md(r"""
 ## 5. Is the signal real? — the hygiene gates
 
-A correlation is an easy way to fool yourself. The gates check that the feature predicts
-*something the market's current state doesn't already tell us*. We build four "control"
-signals from the recent past:
-- **rate momentum** and **rate level** — both built from `λ_ev` (byb's mid-move rate): is byb
-  moving more or less often than usual?
-- **vol momentum** and **vol level** (the same two, for volatility).
-Then we measure the feature's predictive power **on top of** those controls.
+A correlation is an easy way to fool yourself. The gates are **two independent tests** (see the
+Gate A / Gate B box in §6): **(A)** is the feature **regime-invariant** — a stable distribution that
+doesn't leak the vol/rate state — and **(B)** does it **predict** something the market's current state
+doesn't already tell us? The only **controls** for Gate B are the two **regime-invariant momenta**:
+- **rate momentum** — from `λ_ev` (byb's mid-move rate): is byb moving more or less often than its own
+  recent pace?
+- **vol momentum** — the same, for volatility.
+The raw **levels** of vol and rate (`log σ_ev`, `log λ_ev`) are **not** controls — they aren't
+regime-invariant, so they're never model features; we keep them only as the regime *coordinate* for Gate A.
 
 "Predictive power" here is the **rank correlation** between feature and outcome (Spearman —
 robust to outliers), scored **out-of-sample with a purged, expanding-window walk-forward**:
@@ -625,14 +637,16 @@ but scale is not the *relationship*. So beside the gates we run a **companion ch
 marginal power computed **within calm / mid / wild volatility buckets**. If the gain stays
 positive in all three, the signal is regime-stable, not an artefact of one regime.
 
-The gates that follow ask: does the feature *add* over the controls (walk-forward)? Does the
-gain *survive* once we also control for the *level* of vol and rate (so it isn't secretly just
-volatility)? Is its scale steady across volatility states? And does the gain hold across
-volatility *regimes* (the companion)?
+The gates that follow ask, separately: **Gate A** — is the feature's distribution stable across
+volatility states (**scale**, plus neither the feature **nor its magnitude** `|feature|` tracks the regime level
+(monotonically *or* non-monotonically), against **both** the vol and rate coordinate)? **Gate B** — does it *add* signal over the invariant
+momentum controls, walk-forward? And the **companion** — does the Gate-B gain hold across calm / mid /
+wild volatility, not just one regime?
 """)
 
 code(r"""
-# --- the four control signals: the two yardsticks (level) plus a fast/slow momentum of each ---
+# --- the regime signals: the two INVARIANT momenta (the Gate B controls) + the two yardstick LEVELS
+# (the regime COORDINATE for Gate A — used only to bucket/correlate against, NEVER as controls) ---
 FAST_YARD = YARDSTICK_N // 10                        # a faster span (1/10 the yardstick) for the momentum controls
 sig_fast, lam_fast = yardsticks(anchor_ts, FAST_YARD)
 vol_level     = np.log(sigma_at_anchor)                                             # σ_ev — how volatile now
@@ -665,15 +679,27 @@ def wf_ic_by_regime(features, y, reg):              # same, but the mean OOS ran
     return {r: float(np.mean(v)) for r, v in acc.items()}
 
 vol_regime = np.digitize(vol_level, np.nanpercentile(vol_level[np.isfinite(vol_level)], [33, 67]))   # 0 calm, 1 mid, 2 wild
-base, levels = [rate_momentum, vol_momentum], [rate_level, vol_level]   # momenta = base controls; levels added later for the leak test
+# FEATURE_KIND drives GATE B below. "alpha" = a candidate signal that is NOT a regime descriptor
+# (OFI, microprice, flow, price moves) -> judged on MARGINAL value over the controls. "control" = a
+# regime descriptor (vol, rate, volume & their ratios/dynamics) -> itself a valid feature, but it
+# OVERLAPS the controls, so it's judged on STANDALONE signal (its cross-venue legs stay a lead test).
+FEATURE_KIND = "alpha"                                                  # price_dislocation = a cross-venue signal, not a regime descriptor
+base = [rate_momentum, vol_momentum]                                   # the ONLY controls: regime-INVARIANT momenta. Raw vol/rate LEVELS are never controls (not valid features).
+STRAT_VAR = None                                                       # mechanical-coupling guard (HIGH-2): the shared YARDSTICK to STRATIFY by. Set it to the
+                                                                       # denominator of the *scored* target — the gate here always scores the σ_ev PRICE target, so a
+                                                                       # control RATIO that divides by σ_ev sets STRAT_VAR = sigma_at_anchor. (The rate-head analogue,
+                                                                       # for a count/λ_ev clone scored against a count/λ_ev target, is lam_at_anchor.) Gate B then scores
+                                                                       # the feature WITHIN strata of that yardstick, so the shared denominator can't manufacture IC
+                                                                       # (the spurious correlation of ratios) — stratifying multiplicatively DECOUPLES the shared scale,
+                                                                       # where a linear partial over-removes genuine within-yardstick signal. A SIGNED price-head alpha like
+                                                                       # price_dislocation shares no denominator with the σ_ev target (the signs decouple it) -> None.
 print("control-only predictive power (walk-forward):  momenta", round(wf_ic(base, target), 3),
-      " momenta+levels", round(wf_ic(base + levels, target), 3),
       " (near 0 = controls barely predict direction, so any feature gain is genuinely new)")
 """)
 
 md(r"""
 **Conclusion.** On their own the controls carry essentially **no** directional signal —
-walk-forward rank-IC ≈ 0.00 for the momenta, ≈ 0.00 with the levels added. That is exactly what
+walk-forward rank-IC ≈ 0.00 for the momenta. That is exactly what
 we want here: the regime barely predicts *which way* byb moves, so any rank-IC a feature shows
 *on top of* these controls is genuinely new information, not the regime wearing a disguise.
 That's what makes the "added over the controls" gates below a fair test.
@@ -754,36 +780,119 @@ for ex in OTHERS:
 """)
 
 md(r"""
-**Now the gates** (from §5), on the per-exchange features we just chose. Every predictive
-number here is the **walk-forward** mean (causal, purged). Rough pass-marks: the added power
-should be clearly positive (≳ 0.01); it should barely shrink when we add the level controls
-(no leak); and it must be **regime-invariant** — its measured scale staying within ~3× across volatility buckets (a *hard* gate: a feature that drifts with the regime isn't a feature). *Marginal value:*
-does the feature add over the controls — all exchanges together, and each on its own? *No
-leak:* does that gain survive adding the vol/rate levels? *Regime-invariant?* (a **hard** gate): is the feature's *measured* scale
-steady across volatility states — proven, never assumed? *Regime-stable* (the companion): is the marginal gain
-still positive **within** calm, mid, and wild vol — i.e. it doesn't only work in one regime?
+**Now the gates** — and they are **two independent tests**, not one. Every *marginal* number is the
+**walk-forward** mean (causal, purged); the one exception is the control-standalone **stratified** IC, which is
+in-sample decoupled (its out-of-sample confirmation comes from the multi-block harness in `tools/oss`).
+
+**Gate A — regime invariance** (the feature *alone*): is the feature's distribution **independent of the
+regime**, or does it *leak* it? **Control-free** checks: **scale** — its std across vol buckets (max/min,
+want **< ~3**); and then, for **both the signed feature *and* its magnitude `|feature|`** (the rate head is
+fed `|feature|`, so a magnitude that tracks the regime leaks straight into it), two leak modes against **both
+regime coordinates** (vol *and* rate level): **tracking** — `|IC(·, level)|` ≈ 0 (the monotone test, want
+**< ~0.05** for the signed feature, **< ~0.1** for the magnitude), and **dispersion** — the spread of its
+per-decile *means* (want **< ~0.1**), which catches a *non-monotone* leak the monotone IC misses. Each closes
+what the others miss: scale alone passes `z + c·vol_level` (flat std, mean rides the regime); the monotone IC
+misses a *U-shaped* leak (`z + |rank(vol) − 0.5|`) that only dispersion catches; and a feature flat in signed
+mean and scale can still leak through its *magnitude* into the |·|-fed rate head, which only the magnitude
+checks see. The vol/rate level is only the regime *coordinate* here (what we bucket/correlate against),
+**never** a control. Fail any
+one of them = a level in disguise, not a feature.
+
+**Gate B — predictive signal**: does it predict? Because *a control can itself be a valid feature*,
+"signal **over** the controls" only makes sense for a feature that **isn't** a control. `price_dislocation`
+is a cross-venue **alpha** (not a regime descriptor), so Gate B is its **marginal** rank-IC over the
+regime-invariant controls (the momenta — **never** the raw levels), all exchanges together and each on
+its own, want ≳ 0.01. *(A **control-type** feature — a regime descriptor like σ_ev/λ_ev — is instead
+judged on its **standalone** signal, since marginal-over-its-own-controls is circular; only its
+cross-venue legs stay a marginal lead test.)* **Mechanical-coupling guard:** the gate here **always** scores
+the **scored target's denominator**. The §6 gate scores the **σ_ev price target** (`fwd_return/σ_ev`) by
+default, but `signal_ic(..., tgt=rate_target)` lets a **rate-head control** score `count/λ_ev` instead — and
+whichever it scores, a *control ratio* dividing by **that** target's yardstick inflates the IC for a purely
+arithmetic reason (the spurious correlation of ratios). The fix is to **stratify by the shared yardstick**
+and score *within* strata of it (`STRAT_VAR = sigma_at_anchor` for the σ_ev price target, `lam_at_anchor`
+for the λ_ev rate target): stratifying multiplicatively **decouples** the shared denominator, where a linear
+partial over-removes the genuine within-yardstick signal (~87% of it). A **signed price-head alpha** needs
+none — its sign decouples it — so `STRAT_VAR = None`. *(This control-standalone stratified IC is **in-sample**
+decoupled, not walk-forward; its out-of-sample confirmation comes from the multi-block harness in `tools/oss`.)*
+*Regime-stable* (companion): is Gate B still positive **within** calm, mid, and wild vol — not a one-regime artefact?
 """)
 
 code(r"""
 # Gates on the set of per-exchange features — symmetric; KEEP ALL exchanges. Marginal value is checked
 # JOINTLY (do the exchanges together add over the controls?) and per-exchange (does each contribute?), never by picking one.
+# GATE B — predictive signal.
+#   alpha (or a control's CROSS-venue leg): MARGINAL rank-IC over the base momenta — a lead test.
+#   control + OWN-venue leg: STANDALONE (marginal-over-own-momenta is circular). If the control RATIO divides
+#   by the scored target's yardstick (STRAT_VAR set), score it STRATIFIED by that yardstick — multiplicatively
+#   decoupling the shared denominator (HIGH-2), where a linear partial would over-remove genuine signal.
+#   own=True selects the standalone branch.
+def stratified_ic(feat, tgt, sv, nb=40):              # mean within-stratum Spearman, stratifying by the shared yardstick sv
+    fin = np.isfinite(feat) & np.isfinite(tgt) & np.isfinite(sv)
+    edges = np.nanquantile(sv[fin], np.linspace(0, 1, nb + 1)[1:-1])    # ISSUE-5: equal-MASS bins, finer nb -> tames a heavy-tailed sv
+    bkt = np.digitize(sv, edges)
+    ics, ws = [], []
+    for b in range(nb):
+        m = fin & (bkt == b)
+        if m.sum() > 100 and np.std(feat[m]) > 0 and np.std(tgt[m]) > 0:    # BLOCKER-3: skip constant buckets (Spearman would be NaN)
+            r = spearmanr(feat[m], tgt[m]).statistic
+            if np.isfinite(r): ics.append(r); ws.append(int(m.sum()))       # BLOCKER-3: drop any residual NaN before the weighted mean
+    return float(np.average(ics, weights=ws)) if ics else float("nan")
+def signal_ic(leg_feats, *, own, tgt=None):                              # BLOCKER-2: tgt defaults to the price target; a RATE-head control passes tgt=rate_target
+    tgt = target if tgt is None else tgt
+    if FEATURE_KIND == "control" and own:                                # STANDALONE control: decouple the shared yardstick
+        if STRAT_VAR is None:                                            # LOW-1 footgun: an un-decoupled standalone IC
+            print("  WARNING: control + own-leg with STRAT_VAR=None — the standalone IC is NOT decoupled from a "
+                  "shared yardstick; set STRAT_VAR to the scored target's denominator if the feature divides by it.")
+            return round(float(np.mean([ic(f, tgt) for f in leg_feats])), 3)
+        return round(float(np.mean([stratified_ic(f, tgt, STRAT_VAR) for f in leg_feats])), 3)
+    return round(wf_ic(base + leg_feats, tgt) - wf_ic(base, tgt), 3)      # alpha / control-cross: marginal over base
+def signal_ic_by_regime(leg_feats, *, own, tgt=None):                    # the regime-stable companion — SAME Gate-B logic
+    tgt = target if tgt is None else tgt
+    if FEATURE_KIND == "control" and own and STRAT_VAR is not None:      # stratified_ic restricted to each vol_regime bucket
+        out = {}
+        for r in np.unique(vol_regime[np.isfinite(vol_regime)]):
+            rm = (vol_regime == r)
+            out[int(r)] = round(float(np.mean([stratified_ic(np.where(rm, f, np.nan), tgt, STRAT_VAR) for f in leg_feats])), 3)
+        return out
+    full = wf_ic_by_regime(base + leg_feats, tgt, vol_regime)
+    basr = wf_ic_by_regime(base, tgt, vol_regime)
+    return {r: round(full[r] - basr.get(r, 0.0), 3) for r in full}
+def ic(a, b):
+    m = np.isfinite(a) & np.isfinite(b)
+    return float(spearmanr(a[m], b[m]).statistic) if m.sum() > 100 else float("nan")
+
 disloc = {ex: price_dislocation(ex, FAST[price_member[ex][0]], SLOW[price_member[ex][1]]) for ex in OTHERS}
-joint      = round(wf_ic(base + list(disloc.values()), target) - wf_ic(base, target), 3)
-joint_leak = round(wf_ic(base + levels + list(disloc.values()), target) - wf_ic(base + levels, target), 3)
-rep = disloc[OTHERS[0]]                                 # same construction for every exchange -> one is enough for the scale check
-vol_decile = np.digitize(vol_level, np.nanpercentile(vol_level[np.isfinite(vol_level)], np.arange(10, 100, 10)))
-band = [np.nanstd(rep[vol_decile == d]) for d in range(10)]
-# companion: marginal IC within each vol regime — does the joint gain hold up, or flip, across regimes?
-full_r = wf_ic_by_regime(base + list(disloc.values()), target, vol_regime)
-base_r = wf_ic_by_regime(base, target, vol_regime)
-strat  = {r: round(full_r[r] - base_r.get(r, 0.0), 3) for r in full_r}
-gate_rows = [dict(gate="marginal value", detail="all exchanges together, added over the controls", value=joint)]
-gate_rows += [dict(gate="marginal value", detail=f"{ex} alone, added over the controls",
-                   value=round(wf_ic(base + [disloc[ex]], target) - wf_ic(base, target), 3)) for ex in OTHERS]
-gate_rows += [dict(gate="no leak", detail="gain still there after adding the vol/rate levels?", value=joint_leak),
-              dict(gate="regime-invariant?", detail="scale across vol buckets (max/min) — HARD: must read the same in calm & wild, measured not assumed; want < ~3", value=round(max(band) / min(band), 2))]
-gate_rows += [dict(gate="regime-stable", detail=f"marginal IC within {nm}-vol (companion: stay positive)", value=strat.get(r, float("nan")))
+joint = signal_ic(list(disloc.values()), own=False)
+strat = signal_ic_by_regime(list(disloc.values()), own=False)
+rep = disloc[OTHERS[0]]                                 # same construction for every exchange -> one is enough for Gate A
+# GATE A — regime invariance (vol_level/rate_level are the regime COORDINATE, never controls): scale, plus
+# the signed feature AND its magnitude |feature| (the rate head's input) each checked for regime leakage two
+# ways x two coordinates — TRACK = |IC(., vol/rate level)| (monotone mean/magnitude drift) and DISP =
+# per-decile-mean dispersion vs vol OR rate (a NON-monotone, e.g. U-shaped, leak the monotone IC misses).
+vol_decile  = np.digitize(vol_level,  np.nanpercentile(vol_level[np.isfinite(vol_level)],   np.arange(10, 100, 10)))
+rate_decile = np.digitize(rate_level, np.nanpercentile(rate_level[np.isfinite(rate_level)], np.arange(10, 100, 10)))
+band  = [np.nanstd(rep[vol_decile == d]) for d in range(10)]
+def _disp(x, norm):                                    # max per-decile-MEAN dispersion of x over BOTH regime coordinates (÷ norm)
+    return max(float(np.nanstd([np.nanmean(x[dec == k]) for k in range(10)]) / (norm + 1e-12)) for dec in (vol_decile, rate_decile))
+loc_v = abs(ic(rep, vol_level)); loc_r = abs(ic(rep, rate_level))                  # monotone MEAN-tracking vs each regime level
+mag_v = abs(ic(np.abs(rep), vol_level)); mag_r = abs(ic(np.abs(rep), rate_level))  # N1/ISSUE-4: |feature| (the rate head's input) must not track the regime either
+mean_disp = _disp(rep, np.nanstd(rep))                                            # NON-monotone MEAN leak (vs vol OR rate)
+mag_disp  = _disp(np.abs(rep), np.nanmean(np.abs(rep)))                           # NON-monotone MAGNITUDE leak (vs vol OR rate)
+# LOW-1 sanity: an "alpha" must NOT be a hidden regime descriptor -> its overlap with the momenta is small.
+print(f"FEATURE_KIND={FEATURE_KIND!r} | feature vs momenta |IC|: rate {abs(ic(rep, rate_momentum)):.3f} vol {abs(ic(rep, vol_momentum)):.3f}  (large for an 'alpha' => it's really a control)")
+gate_rows = [dict(gate="B · signal", detail="all exchanges together — marginal over the invariant controls", value=joint)]
+gate_rows += [dict(gate="B · signal", detail=f"{ex} alone — marginal over the controls",
+                   value=signal_ic([disloc[ex]], own=False)) for ex in OTHERS]
+gate_rows += [dict(gate="A · regime-inv (scale)",      detail="feature scale across vol buckets (max/min) — HARD, want < ~3", value=round(max(band) / min(band), 2)),
+              dict(gate="A · regime-inv (mean-track)", detail="|IC(feature, vol level)| — no monotone mean-drift; want < ~0.05", value=round(loc_v, 3)),
+              dict(gate="A · regime-inv (mean-track)", detail="|IC(feature, rate level)| — want < ~0.05", value=round(loc_r, 3)),
+              dict(gate="A · regime-inv (mean-disp)",  detail="non-monotone mean leak — per-decile-mean dispersion vs vol OR rate; want < ~0.1", value=round(mean_disp, 3)),
+              dict(gate="A · regime-inv (mag-track)",  detail="|IC(|feature|, vol level)| — the rate head sees |feature|, so its magnitude must not track the regime; want < ~0.1", value=round(mag_v, 3)),
+              dict(gate="A · regime-inv (mag-track)",  detail="|IC(|feature|, rate level)| — want < ~0.1", value=round(mag_r, 3)),
+              dict(gate="A · regime-inv (mag-disp)",   detail="non-monotone magnitude leak — per-decile-mean-|feature| dispersion vs vol OR rate; want < ~0.1", value=round(mag_disp, 3))]
+gate_rows += [dict(gate="regime-stable", detail=f"signal within {nm}-vol (companion: stay positive)", value=strat.get(r, float("nan")))
               for r, nm in [(0, "calm"), (1, "mid"), (2, "wild")]]
+pl.Config.set_tbl_rows(15); pl.Config.set_fmt_str_lengths(60)
 pl.DataFrame(gate_rows)
 """)
 
@@ -791,13 +900,68 @@ md(r"""
 **Conclusion.** `price_dislocation` clears every gate. It adds ≈ **0.086** walk-forward rank-IC over the
 controls — jointly and for bin alone (okx alone adds ≈ 0.048, but jointly bin already captures the shared
 signal so the joint marginal = bin-alone ≈ 0.086; we keep okx anyway because leadership rotates and its
-standalone gain is positive) — far above the ~0.01 floor. The gain barely dips to ≈ **0.09** once the
-vol/rate *levels* are added, so it isn't a disguised volatility signal. Its scale wanders only **1.23×**
-across volatility buckets (well under 3×), so it's model-ready as-is. And the companion shows the marginal
+standalone gain is positive) — far above the ~0.01 floor (**Gate B**). Its distribution wanders only
+**1.23×** across volatility buckets, barely tracks the regime (mean-track |IC| 0.00 / 0.01), its per-decile
+means barely move (bucket-mean dispersion ≈ 0.02), and its magnitude only weakly tracks vol (≈ 0.07 — the
+loosest of the Gate A checks, but still under the ~0.1 bar), so it's **regime-invariant on every Gate A check**
+(**Gate A**) — not a level in disguise — and model-ready as-is. And the companion shows the marginal
 gain positive in **all three** regimes — 0.066 / 0.085 / 0.116 for calm / mid / wild — so the signal is
 regime-stable, not a one-regime artefact. Verdict: real and ship-able, for **both heads, every exchange**.
 The chosen scales match the story — the price head took a lightly-smoothed fast leg over a moderate slow
 one (fast=10, slow=500) for both venues; the rate head stayed sharp (fast=1, slow=100).
+""")
+
+md(r"""
+### Self-test — does the stratify-by-yardstick decouple actually work?
+
+The alpha worked example above never exercises the **control** branch (`FEATURE_KIND="control"`, own-leg,
+`STRAT_VAR` set), so this small cell checks the one thing that branch relies on: that **stratifying by the
+shared yardstick kills a purely-mechanical ratio coupling while keeping a real signal**. We build, on the
+grid, a `count/λ_ev`-style rate-head target and two control *ratios that both divide by `λ_ev`* (so
+`STRAT_VAR = lam_at_anchor`):
+- **pure-spurious** — a numerator with **no** real link to the count, divided by `λ_ev`. Its **raw** Spearman
+  against the target is large (the shared `1/λ_ev` manufactures it); **stratified** by `λ_ev` it collapses to ≈0.
+- **real-signal** — a numerator that genuinely tracks the count, divided by `λ_ev`. Its raw IC is inflated by
+  the same coupling, but the **stratified** IC keeps the genuine within-stratum signal.
+
+If `stratified_ic` returns ≈0 for the spurious ratio (vs a large raw IC) and recovers the real one, the
+decouple does what Gate B's control branch needs.
+""")
+
+code(r"""
+# SELF-TEST of the control-branch decouple (does NOT touch the alpha worked example above).
+rng = np.random.default_rng(0)
+# a count/λ_ev-style rate-head target on the grid (the same shape rate_target has)
+st_count  = (cum_mv[np.searchsorted(byb_rx, anchor_ts + HORIZON_NS, "right")]
+             - cum_mv[np.searchsorted(byb_rx, anchor_ts, "right")]).astype(float)   # byb moves over the next 100 ms
+st_target = st_count / np.maximum(lam_at_anchor, 1e-9)                               # count ÷ λ_ev (the scored ratio target)
+st_lam    = lam_at_anchor                                                            # the shared yardstick == STRAT_VAR
+
+# PURE-SPURIOUS control ratio: numerator independent of the count, divided by the SAME λ_ev -> shares only the denominator.
+# Keep the numerator nearly CONSTANT so the shared 1/λ_ev dominates the ratio's variance -> a fake raw IC the stratify removes.
+spur_num   = 1.0 + 0.25 * rng.standard_normal(len(anchor_ts))                        # constant-ish, count-independent numerator
+spur_ratio = spur_num / np.maximum(st_lam, 1e-9)
+# REAL-signal control ratio: numerator that genuinely predicts the count, divided by the SAME λ_ev.
+real_num   = st_count + 3.0 * rng.standard_normal(len(anchor_ts))                    # tracks the count (with noise)
+real_ratio = real_num / np.maximum(st_lam, 1e-9)
+
+def _raw(f, y):
+    m = np.isfinite(f) & np.isfinite(y); return float(spearmanr(f[m], y[m]).statistic)
+print("control-branch decouple self-test — THROUGH signal_ic (target = count/λ_ev, STRAT_VAR = λ_ev, heavy-tailed):")
+spur_raw, real_raw = _raw(spur_ratio, st_target), _raw(real_ratio, st_target)
+_k, _s = FEATURE_KIND, STRAT_VAR                                          # BLOCKER-2: exercise the REAL gate path (signal_ic), not stratified_ic directly
+try:
+    globals().update(FEATURE_KIND="control", STRAT_VAR=st_lam)           # st_lam == lam_at_anchor is genuinely heavy-tailed (ISSUE-5 stress)
+    spur_gate = signal_ic([spur_ratio], own=True, tgt=st_target)
+    real_gate = signal_ic([real_ratio], own=True, tgt=st_target)
+finally:
+    globals().update(FEATURE_KIND=_k, STRAT_VAR=_s)
+print(f"  pure-spurious:  raw Spearman {spur_raw:+.3f}  ->  signal_ic {spur_gate:+.3f}   (want raw large, gated ~0)")
+print(f"  real-signal:    raw Spearman {real_raw:+.3f}  ->  signal_ic {real_gate:+.3f}   (want signal kept)")
+assert abs(spur_gate) < 0.04,                      f"stratify failed to kill the spurious heavy-tailed coupling ({spur_gate:+.3f})"
+assert abs(spur_raw) > 3 * abs(spur_gate) + 0.04,  f"spurious raw IC not materially larger than gated ({spur_raw:+.3f} vs {spur_gate:+.3f})"
+assert abs(real_gate) > 0.05,                      f"stratify destroyed the real signal ({real_gate:+.3f})"
+print("  OK — the gate's control path decouples the spurious heavy-tailed ratio and keeps the real signal.")
 """)
 
 md(r"""
@@ -989,9 +1153,10 @@ whenever you feed a network. The heavier transforms (arcsinh, rank-Gaussian) fla
 further but would just throw information away here. A skewed or fat-tailed feature would push you
 the other way; the QQ-plot tells you which.
 
-**Still to run** (same machinery): the leak check *inside* volatility buckets; whether the
-feature adds over features we already have; whether the signal is steady day-to-day; and
-whether it survives out-of-sample across a market-regime change.
+**Still to run** (same machinery): whether the feature adds over features we already have;
+whether the signal is steady day-to-day; and whether it survives out-of-sample across a
+market-regime change. (The leak check *inside* volatility buckets is no longer pending —
+Gate A's checks and the regime-stable companion now run it.)
 """)
 
 md(r"""

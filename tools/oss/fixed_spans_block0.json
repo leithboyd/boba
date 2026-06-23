@@ -1,0 +1,261 @@
+{
+  "microprice": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "prem_byb",
+      "prem_okx",
+      "prem_bin",
+      "gap_okx-byb",
+      "gap_bin-byb"
+    ],
+    "fixed_spans": {
+      "prem_byb": 1,
+      "prem_okx": 1,
+      "prem_bin": 1,
+      "gap_okx-byb": 1,
+      "gap_bin-byb": 1
+    }
+  },
+  "ofi_normalised": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "byb": 10,
+      "okx": 10,
+      "bin": 10
+    }
+  },
+  "ofi": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "bin",
+      "okx"
+    ],
+    "fixed_spans": {
+      "byb": [
+        10,
+        5000
+      ],
+      "bin": [
+        10,
+        5000
+      ],
+      "okx": [
+        10,
+        5000
+      ]
+    }
+  },
+  "price_momentum": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "byb": 10,
+      "okx": 10,
+      "bin": 10
+    }
+  },
+  "flow_persistence": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "bin",
+      "byb",
+      "okx"
+    ],
+    "fixed_spans": {
+      "bin": 20,
+      "byb": 20,
+      "okx": 20
+    }
+  },
+  "xv_book_pressure": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "gap_okx-byb_QI",
+      "gap_okx-byb_prem",
+      "gap_bin-byb_QI",
+      "gap_bin-byb_prem"
+    ],
+    "fixed_spans": {
+      "gap_okx-byb_QI": 1,
+      "gap_okx-byb_prem": 1,
+      "gap_bin-byb_QI": 1,
+      "gap_bin-byb_prem": 1
+    }
+  },
+  "trade_rate_surge": {
+    "head": "rate",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "byb": [
+        30,
+        10000
+      ],
+      "okx": [
+        30,
+        10000
+      ],
+      "bin": [
+        30,
+        10000
+      ]
+    }
+  },
+  "mid_rate_surge": {
+    "head": "rate",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "byb": [
+        10,
+        10000
+      ],
+      "okx": [
+        10,
+        10000
+      ],
+      "bin": [
+        10,
+        10000
+      ]
+    }
+  },
+  "trade_rate_normalised": {
+    "head": "rate",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "byb": 10,
+      "okx": 30,
+      "bin": 10
+    }
+  },
+  "volume_normalised": {
+    "head": "rate",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "byb": 5000,
+      "okx": 5000,
+      "bin": 5000
+    }
+  },
+  "vol_over_rate": {
+    "head": "rate",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "byb": [
+        40000,
+        2000
+      ],
+      "okx": [
+        40000,
+        2000
+      ],
+      "bin": [
+        40000,
+        2000
+      ]
+    }
+  },
+  "volume_surge": {
+    "head": "rate",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "bin",
+      "okx"
+    ],
+    "fixed_spans": {
+      "byb": [
+        50,
+        500
+      ],
+      "bin": [
+        10,
+        5000
+      ],
+      "okx": [
+        200,
+        5000
+      ]
+    }
+  },
+  "gap_dynamics": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "okx",
+      "bin"
+    ],
+    "fixed_spans": {
+      "okx": 1000,
+      "bin": 1000
+    }
+  },
+  "range_breakout": {
+    "head": "price",
+    "kind": "spans",
+    "legs": [
+      "byb",
+      "bin",
+      "okx"
+    ],
+    "fixed_spans": {
+      "byb": 50,
+      "bin": 50,
+      "okx": 50
+    }
+  },
+  "flow_imbalance": {
+    "head": "price",
+    "kind": "flow_imbalance",
+    "legs": [
+      "bin",
+      "byb",
+      "okx"
+    ],
+    "fixed_spans": {
+      "bin": 5,
+      "byb": 5,
+      "okx": 5
+    }
+  }
+}
