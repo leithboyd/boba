@@ -1,0 +1,2 @@
+# Per-machine settings (gitignored). Points the loaders at the local holocron archive.
+data_dir = "/Users/leith/claude/bob/mando_data/corelliantkdata1/holocron"

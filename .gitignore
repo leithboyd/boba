@@ -15,7 +15,7 @@ build/
 .mypy_cache/
 
 # per-machine settings + build artifacts
-settings.local.toml
+# settings.local.toml
 artifacts/
 
 # notebooks
