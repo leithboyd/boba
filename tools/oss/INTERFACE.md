@@ -78,7 +78,12 @@ added together over the controls) and the **per-venue** marginal IC (each alone)
 ## The on-grid causal-read convention
 
 Every feature is computed on the venue's own native events, then **read at each grid
-anchor using only data at-or-before that anchor** — no peeking. Two standard patterns:
+anchor using only data at-or-before that anchor** — no peeking.
+
+This is the OSS harness version of the project-wide EMA event-clock convention; see
+[`docs/ema_event_clock.md`](../../docs/ema_event_clock.md) for the design rationale.
+
+Two standard patterns:
 
 1. **Trade-clock EMA (sparse flow, e.g. flow_imbalance).** Build the feature as an
    `lfilter` recursion over the per-tick injected mass on `merged_ts` (decay once per
