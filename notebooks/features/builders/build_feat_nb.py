@@ -139,9 +139,10 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
   source of lag. The choice of EMA *and when it updates* is what makes the inter-trade read
   well-behaved — pick both deliberately (see the "Choosing the EMA" section).
 - **Do inject at most one EMA sample per timestamp, and decay once per shared-trade-clock tick — this
-  never changes.** At each timestamp an EMA injects **one** sample *iff* a relevant event lands there
-  (for OFI a byb book update; for `σ_ev` a byb mid-move) and **none** if only trades land — nothing to
-  inject — yet it still **ticks** (decays) once *iff* a trade lands, on the one **shared** trade clock
+  never changes.** At each timestamp an EMA injects **one** sample *iff* a relevant event for that EMA
+  lands there: for OFI, a byb book update; for `σ_ev`, a byb mid-move; for trade volume, the trade
+  flow itself. A timestamp with only **irrelevant** trades injects nothing for that EMA, yet it still
+  **ticks** (decays) once *iff* a trade lands, on the one **shared** trade clock
   (one tick per trade-timestamp across **all** venues, simultaneous prints counting once). Inject and
   decay are independent and neither ever fires more than once per timestamp, whatever the feature.
   Records sharing a timestamp are **one** sample, not a sequence: same-timestamp aggregation sets only
@@ -234,21 +235,19 @@ once we account for how volatile the market is (meaning it was only tracking vol
 """)
 
 md(r"""
-## Choosing the EMA — the part that's easy to get silently wrong
+## Choosing the EMA
 
 Every smoother here is an EMA on the **trade clock**: its **decay** steps once per *trade-timestamp*
-(`α = 2/(span+1)`), but its **value updates at most once per timestamp in between** (same-timestamp events as one update), so a read between trades is
-never stale. That
-looks like plumbing, but two choices decide whether the EMA is even *correct*, and a wrong choice fails
-**silently** — a plausible-looking number that measures the wrong thing or lags the market. So make
-both deliberately for every feature, and let the §4 parity check catch you if you slip.
+(`α = 2/(span+1)`), but its **value updates at most once per timestamp that carries the EMA's own
+relevant event** (same-timestamp events as one update). If that relevant event is a trade flow, the same
+timestamp both injects the flow sample and ticks the shared clock; if the trade is irrelevant to that
+EMA, it only ticks. Choose the EMA type and injection rule for the statistic being measured.
 
 **Choice 1 — which EMA, and how you read it** (`boba.ema`):
 
 - A **sparse flow** — present on only *some* events (byb's mid-moves, a per-exchange trade flow): use
   **`KernelMeanEMA`**, the self-normalising `E / W`. The `W` denominator counts only the events that
-  carry the quantity, so the read is a *per-event mean* and the many non-events cancel instead of
-  counting as zeros.
+  carry the quantity, so the read is a *per-event mean*.
 - A **forward-filled level** — defined at every instant (a price, a cross-venue gap): use
   **`LiveFrontEMA`**, which reads the committed mean carried one step toward the freshest value,
   `(1 − α)·committed + α·latest` — current between trades, never frozen on the last trade.
@@ -257,32 +256,25 @@ both deliberately for every feature, and let the §4 parity check catch you if y
   ratio — for its committed part; that one is an internal building block, not a swap candidate.)
 
 **Choice 2 — *when* you push a value in** (the injection clock — a *separate* decision from the decay
-clock). Decay is always once per trade-timestamp; these injection rules each compute a **different statistic from
-the same numbers**:
+clock). Decay is always once per trade-timestamp; injection is only for timestamps carrying the
+quantity the EMA is measuring. The allowed patterns are:
 
-| push rule | what it weights / measures | use for |
+| pattern | what it weights / measures | use for |
 |---|---|---|
 | commit every trade-timestamp; read refreshes each book-update timestamp | by **trade-dwell** — a value spanning more trades counts more | a level (gap, price) |
-| only on a real event, skip the rest | a **per-real-event mean**; non-events are *non-observations*, not zeros | a flow (vol: push `r²` only on a move) |
-| only when the value changes | each **distinct value equally** — discards dwell, over-weights flickers | — (measured *worse* for a level) |
-| every message, change or not | by **message rate** — up-weights chatty / churny stretches | — (measured *worst*) |
+| only on the feature's real event, skip irrelevant clock ticks | a **per-real-event mean** | a flow (`σ_ev`: push `r²` only on a byb move; trade volume: push summed volume on a trade timestamp) |
 
-The trap: same number, same `α`, different statistic — so a wrong choice is invisible in the code. Push
-a `0` on a non-move trade and "vol per move" silently becomes "vol per *trade*" (now contaminated by the
-trade rate); push on every BBO message and a clean trade-weighted gap becomes quote-churn-weighted. Both
-measurably lowered rank-IC on a real block.
+Classify the timestamp for the EMA being updated. For `σ_ev`, a trade-only timestamp decays the clock
+and injects no sample. For trade volume, that same timestamp injects the timestamp's summed volume and
+ticks the shared clock once.
 
-Two rules keep the read correct **between** trades — the regime where this is easiest to get wrong:
+Between trades:
 
 - **React at every relevant timestamp, and read the freshest value.** Decay rides the trade clock, but the
   EMA must *update* at every timestamp that can move it (same-timestamp events as one update), and the read must reflect the timestamps since the last
-  trade — never a stale snapshot. Why fresh is the default even when it measures ≈neutral: the cost is
-  *asymmetric*. When trades are dense the last-trade snapshot is barely stale, so freshness is free; when
-  trades are sparse a stale read lags badly — and you can't know in advance which regime a future block
-  is in.
+  trade — never a stale snapshot.
 - **Records sharing a timestamp are ONE update, not a sequence** — apply them all, then register a single
-  update (one mid, one move, one refresh). Treating them as a sequence invents motion that never happened
-  in time. (Both rules are in the guard rails; the §4 parity check enforces them.)
+  update (one mid, one move, one refresh).
 """)
 
 md(r"""
@@ -425,7 +417,7 @@ md(r"""
 ## 3. Build it (twice)
 
 Build the feature two ways: this fast array version for analysis, and — in production — a
-streaming version that does constant work per trade (no growing buffers). They have to agree,
+streaming version that does constant work per ingested event (no growing buffers). They have to agree,
 which §4 checks.
 
 Here we lay an evaluation grid every 50 ms (half the 100 ms horizon — plenty of samples; note

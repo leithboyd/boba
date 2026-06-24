@@ -178,6 +178,10 @@ listings, and the clock is part of the column name (and the cache identity). Eve
 tick-EMA'd over the clock's trade events (span N = N clock trades), forward-filled to the grid,
 0 before the first clock trade.
 
+The rationale for the EMA/tick-injection convention is not repeated here; see
+[`ema_event_clock.md`](ema_event_clock.md) for the single-clock design, flow-vs-level split,
+and `E/W` reading rules. This section is the column-level contract.
+
   Realized vol of the MID = (bid + ask)/2. tick-EMA of the per-interval realized variance (the
   sum of squared 1ms mid log-returns in each clock interval) — clock = window ruler, mid path
   full-resolution (so it counts every move, not just those at trade instants):
