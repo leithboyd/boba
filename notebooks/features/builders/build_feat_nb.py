@@ -27,13 +27,13 @@ their own.
 byb's. When one exchange moves and the others haven't caught up yet, that gap predicts the
 catch-up. It's a good teacher because it touches every step.
 
-**A feature is "done" when two checks pass:**
+**A feature's *analysis* is done when two checks pass:**
 - **The oracle (§4)** — the code really computes what we think it does.
 - **The hygiene gates (§5)** — the signal is real and holds in any market, not just an echo
   of "the market is volatile right now."
 
 Everything after that decides *which part of the model* the feature feeds, and *at what
-time-scale*.
+time-scale* — and the §10 checklist (streaming builder, tests, multi-block OOS) gates **shipping**: analysis-done is not ship-done.
 """)
 
 md(r"""
@@ -176,7 +176,7 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 - **Do use the freshest valid price per exchange.**
 - **Do treat a feature as a family across time-scales** and let the data assign scales to heads.
 - **Do prove regime-invariance with Gate A — never assume it.** A usable feature reads the *same* in calm and
-  wild markets: its distribution must be **independent of the regime**. Gate A's **control-free** checks (§6):
+  wild markets: its distribution must be **stable against the regime diagnostics we track** (not a proof of independence). Gate A's **control-free** checks (§6):
   **scale** (std stable across vol buckets, max/min < ~3); and — for **both the signed feature and its
   magnitude `|feature|`** (the rate head sees the signed feature but can learn its magnitude) — that it does **not track** the regime
   (`|IC(·, vol & rate level)| ≈ 0`, the monotone test) **nor leak non-monotonically** (per-decile-mean
@@ -188,8 +188,8 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
   circular" — you haven't measured on a real block.)
 - **Don't fuse the two gates — they're independent.** *Regime invariance* (Gate A) is the feature's own
   distribution being stable across regimes; *signal* (Gate B) is what it predicts over the **invariant**
-  controls. The raw vol/rate **levels are never controls** (they aren't valid features) — putting them in
-  the signal test just smuggles the regime test back in. And **a control can be a valid feature**: when the
+  controls. The raw vol/rate **levels aren't Gate-B controls** (they aren't valid alpha features) — putting them in
+  the signal test just smuggles the Gate-A regime test back in; they serve only as the Gate-A regime *coordinate*. And **a control can be a valid feature**: when the
   feature under test *is* a regime descriptor, marginal-over-its-own-controls is circular — judge it on its
   **standalone** signal, and never call it "redundant" from its algebra alone.
 """)
@@ -372,7 +372,8 @@ print(f"trade clock: {n_ticks:,} ticks (timestamps) from {len(trade_prints):,} t
 
 def mid_on_clock(ex):                              # causal: each exchange's most-recent mid at-or-before every clock tick
     rx, mid = mids[ex]
-    return mid[np.clip(np.searchsorted(rx, merged_ts, "right") - 1, 0, len(mid) - 1)]
+    idx = np.searchsorted(rx, merged_ts, "right") - 1
+    return np.where(idx < 0, np.nan, mid[np.clip(idx, 0, len(mid) - 1)])   # nan before the venue's first quote (no future-fill); pre-quote rows are neutralised below
 log_mid_byb = np.log(mid_on_clock("byb"))
 
 # Both yardsticks react to EVERY byb merged-mid change (the same newest-exchange-time front_levels/trade mid logic) —
@@ -438,9 +439,12 @@ mid_fwd    = byb_mid[np.searchsorted(byb_rx, anchor_ts + HORIZON_NS, "right") - 
 fwd_return = np.log(mid_fwd / mid_now)
 target     = fwd_return / sigma_at_anchor                          # byb's 100 ms return ÷ σ_ev — the price head's target (regime-normalised, σ-units)
 
-gap_committed = {ex: np.log(mid_on_clock(ex)) - log_mid_byb for ex in OTHERS}   # each other's log gap vs byb, on the trade clock (the committed legs)
+gap_committed = {}                                                             # each other's log gap vs byb, on the trade clock (the committed legs)
+for ex in OTHERS:
+    g = np.log(mid_on_clock(ex)) - log_mid_byb                                 # nan before ex/byb has quoted (mid_on_clock returns nan pre-quote)
+    gap_committed[ex] = np.nan_to_num(g, nan=0.0)                              # no committed gap until both venues have quoted — neutral, and decayed away by WARMUP anyway
 def _mid_at(ex, t):                                                # a venue's mid forward-filled to arbitrary times (for the FRESH gap)
-    rx, mid = mids[ex]; return mid[np.clip(np.searchsorted(rx, t, "right") - 1, 0, len(mid) - 1)]
+    rx, mid = mids[ex]; idx = np.searchsorted(rx, t, "right") - 1; return np.where(idx < 0, np.nan, mid[np.clip(idx, 0, len(mid) - 1)])   # nan before first quote; the finite-mask drops such rows
 gap_anchor = {ex: np.log(_mid_at(ex, anchor_ts)) - np.log(_mid_at("byb", anchor_ts)) for ex in OTHERS}   # the gap as of each grid anchor — every book update, never stale
 def ema(gap, N):
     if N == 1: return gap                                          # all weight on the latest tick
@@ -642,6 +646,8 @@ point IC overstates its own precision — so for the **headline marginal** we al
 blocks sized to the EMA/yardstick memory (block length derived from the block's own trade-rate, not hard-coded),
 so the interval respects the autocorrelation rather than pretending all ~1.7 M anchors are independent.
 
+Rank-IC is a **feature-screening** statistic, not a distributional score — proper scoring (NLL/CRPS, occurrence log-loss, calibration) and cost-aware utility are judged at the **model** level downstream, not in this per-feature template.
+
 Because the feature and target are both in σ-units, a *scale* regime-shift mostly cancels —
 but scale is not the *relationship*. So beside the gates we run a **companion check**: the same
 marginal power computed **within calm / mid / wild volatility buckets**. If the gain stays
@@ -679,6 +685,7 @@ vol_regime = np.digitize(vol_level, np.nanpercentile(vol_level[np.isfinite(vol_l
 # OVERLAPS the controls, so it's judged on STANDALONE signal (its cross-venue legs stay a lead test).
 FEATURE_KIND = "alpha"                                                  # price_dislocation = a cross-venue signal, not a regime descriptor
 base = [rate_momentum, vol_momentum]                                   # the ONLY controls: regime-INVARIANT momenta. Raw vol/rate LEVELS are never controls (not valid features).
+# byb momenta proxy the GLOBAL regime — one instrument, cross-venue divergence is arbed away fast, so at this slow control scale all venues share one regime; foreign-venue momenta would just re-add it.
 STRAT_VAR = None                                                       # mechanical-coupling guard (HIGH-2): the shared YARDSTICK to STRATIFY by. Set it to the
                                                                        # denominator of the *scored* target — the gate here always scores the σ_ev PRICE target, so a
                                                                        # control RATIO that divides by σ_ev sets STRAT_VAR = sigma_at_anchor. (The rate-head analogue,
@@ -796,8 +803,8 @@ since the test folds also informed the span pick. Held-out span selection is def
 `tools/oss` harness; here the choice is among a small 4×4 fast/slow grid (15 valid pairs) of near-identical
 neighbours, so the selection bias is expected to be small (we don't measure it on this single block).
 
-**Gate A — regime invariance** (the feature *alone*): is the feature's distribution **independent of the
-regime**, or does it *leak* it? **Control-free** checks: **scale** — its std across vol buckets (max/min,
+**Gate A — regime invariance** (the feature *alone*): is the feature's distribution **stable against our regime
+diagnostics**, or does it *leak* it? **Control-free** checks: **scale** — its std across vol buckets (max/min,
 want **< ~3**); and then, for **both the signed feature *and* its magnitude `|feature|`** (the rate head
 receives the *signed* feature and can learn its magnitude, so a magnitude that tracks the regime would leak
 into it), two leak modes against **both
@@ -1047,7 +1054,7 @@ def _ic(feat, ret):
     v = np.isfinite(feat) & np.isfinite(ret)
     return spearmanr(feat[v], ret[v]).statistic if v.sum() > 100 else float("nan")
 def _mid_at(t):                                          # byb merged mid at-or-before t (causal)
-    return byb_mid[np.clip(np.searchsorted(byb_rx, t, "right") - 1, 0, len(byb_mid) - 1)]
+    idx = np.searchsorted(byb_rx, t, "right") - 1; return np.where(idx < 0, np.nan, byb_mid[np.clip(idx, 0, len(byb_mid) - 1)])   # nan before byb's first quote
 def _ret(t0, t1):  return np.log(_mid_at(t1) / _mid_at(t0))
 def _count(t0, t1): return cum_mv[np.searchsorted(byb_rx, t1, "right")] - cum_mv[np.searchsorted(byb_rx, t0, "right")]
 
@@ -1206,7 +1213,7 @@ fig.tight_layout(); plt.show()
 md(r"""
 **Conclusion.** For this feature the printout settles it: it's already near-symmetric (skew ≈ 0)
 with only mild fat tails — *because* it's divided by `σ_ev` — so a plain rescale (z-score) keeps
-the excess kurtosis low. But it still leaves a ≈21σ spike (max|·| = 21.3), which violates the
+the excess kurtosis low. But it still leaves a ≈28σ spike (max|·| = 27.8), which violates the
 "no wild outliers" bar — so the z-score alone doesn't clear it. The lightest transform that
 *meets* the bar is a robust z-score followed by a clip (robust + clip ±4 → max|·| = 4.0), so you clip
 whenever you feed a network. The heavier transforms (arcsinh, rank-Gaussian) flatten the tails
