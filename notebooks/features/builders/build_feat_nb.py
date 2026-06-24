@@ -118,6 +118,22 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 - **Don't trust a correlation** until it survives the regime controls (rate and vol) — else
   it may just be re-reporting "the market is volatile."
 - **Don't ship a feature without the §4 parity check** — a second, production-style build reproducing it on real data.
+- **Don't hand-roll a streaming EMA, and don't use `EventEMA` — use only `KernelMeanEMA` or `LiveFrontEMA`.**
+  Every *online* average — the §4 production/streaming parity build, and any event-by-event EMA state anywhere
+  in the notebook — MUST be exactly one of **two** `boba.ema` classes: **`KernelMeanEMA`** (the self-normalising
+  `E / W` read — for a **flow**) or **`LiveFrontEMA`** (the live-front read — for a **level**). Both expose
+  **separate `tick()` (decay) and `add()` (inject)** calls — that separation is the whole point: decay rides the
+  shared trade clock (once per trade-timestamp) while injection rides each relevant-event timestamp, and the two
+  must fire **independently** (see the inject-≠-decay rule below). **Never use `EventEMA`:** its single `step()`
+  **couples decay and injection** into one call, so it *cannot* decay on the trade clock while injecting on a
+  different event stream — that directly violates the inject-once / decay-once-independently rule. And **never**
+  hand-roll a scalar EMA (no private `_ScalarEMA`, no `(1−α)·s + α·x` per-event loop) or reach for
+  `scipy.signal.lfilter` in the streaming build. Every quantity here is either a **flow** (→ `KernelMeanEMA`) or
+  a **level** (→ `LiveFrontEMA`); if you think you need anything else, you've mis-modelled it (a slope/covariance
+  is a ratio of flow EMAs — several `KernelMeanEMA`s, not a bespoke class). §4 exists to validate the **actual
+  production code** (`boba.ema` online vs §3's vectorized path), not a throwaway re-implementation that could
+  carry the same blind spot. (The §3 *vectorized* analysis may still use `lfilter` — the offline array path, not
+  online EMA state.)
 - **Don't peek ahead.** Every value uses only data at-or-before its own timestamp.
 - **Don't over-transform for the network.** Pick the lightest reshaping that works.
 
@@ -251,9 +267,11 @@ EMA, it only ticks. Choose the EMA type and injection rule for the statistic bei
 - A **forward-filled level** — defined at every instant (a price, a cross-venue gap): use
   **`LiveFrontEMA`**, which reads the committed mean carried one step toward the freshest value,
   `(1 − α)·committed + α·latest` — current between trades, never frozen on the last trade.
-- `KernelMeanEMA` and `LiveFrontEMA` share the `tick` / `add` / `value` interface, so you A/B the two
-  reads by swapping the class. (`LiveFrontEMA` composes a plain **`EventEMA`** — `step` / `value`, no
-  ratio — for its committed part; that one is an internal building block, not a swap candidate.)
+- `KernelMeanEMA` and `LiveFrontEMA` are the **only** two classes you may use, and they share the
+  `tick` / `add` / `value` interface (decay and injection are *separate* calls), so you A/B the two reads by
+  swapping the class. (`LiveFrontEMA` composes a plain `EventEMA` internally for its committed part, but
+  **never use `EventEMA` directly**: its single `step()` couples decay and injection, so it cannot decay on the
+  trade clock while injecting on a separate event stream — the very thing the next section requires.)
 
 **Choice 2 — *when* you push a value in** (the injection clock — a *separate* decision from the decay
 clock). Decay is always once per trade-timestamp; injection is only for timestamps carrying the
@@ -790,6 +808,62 @@ for ex in OTHERS:
     pi, pj = price_member[ex]; ri, rj = rate_member[ex]
     print(f"  {ex}:  price head (fast={FAST[pi]}, slow={SLOW[pj]}) power={price_grid[ex][pi, pj]:.3f}"
           f"   |  rate head (fast={FAST[ri]}, slow={SLOW[rj]}) power={rate_grid[ex][ri, rj]:.3f}")
+
+# === Does a SECOND time-scale ADD over the pick? — the sweep RE-SCORED conditional on the best member, PER HEAD ===
+# Selection lives here in §6. We picked the best span per head by IC; now re-score the WHOLE family as
+# partial-IC(cell | chosen) -- each cell's IC against the head's target, CONTROLLING for the span we picked (the
+# same partial-IC tool the echo-netting cell uses; control = the chosen span, not the trailing move).
+# A cell still LIT adds signal ORTHOGONAL to the pick; a cell that COLLAPSES to ~0 is a diluted copy. The heat-map
+# is in-sample, so the keep/drop DECISION is the walk-forward joint-vs-solo OOS IC (wf_ic, imported in §5).
+def _pic(f, y, c):                                                   # partial rank-IC of f with y, controlling for c
+    m = np.isfinite(f) & np.isfinite(y) & np.isfinite(c)
+    if m.sum() <= 100: return np.nan
+    rfy = spearmanr(f[m], y[m]).statistic; rfc = spearmanr(f[m], c[m]).statistic; rcy = spearmanr(c[m], y[m]).statistic
+    return (rfy - rfc * rcy) / np.sqrt(max((1.0 - rfc**2) * (1.0 - rcy**2), 1e-12))
+
+# Per head: feat() maps a cell to its scored feature, tgt is the head's target, member is the in-sample pick.
+HEADS = [("price head", lambda ex, nf, ns: price_dislocation(ex, nf, ns),         target,      price_member),
+         ("rate head",  lambda ex, nf, ns: np.abs(price_dislocation(ex, nf, ns)), rate_target, rate_member)]
+fig, axes = plt.subplots(len(HEADS), len(OTHERS), figsize=(5.6 * len(OTHERS), 4.2 * len(HEADS)), squeeze=False)
+second = {}
+for row, (head, feat, tgt, member) in enumerate(HEADS):
+    print(f"does a 2nd span add over the pick? — {head}: conditional partial-IC (in-sample screen) + walk-forward joint-vs-solo OOS:")
+    for col, ex in enumerate(OTHERS):
+        ci, cj = member[ex]; chosen = feat(ex, FAST[ci], SLOW[cj])
+        cond = np.full((len(FAST), len(SLOW)), np.nan)
+        for i, nf in enumerate(FAST):
+            for j, ns in enumerate(SLOW):
+                if nf < ns: cond[i, j] = 0.0 if (i, j) == (ci, cj) else _pic(feat(ex, nf, ns), tgt, chosen)
+        ax = axes[row][col]; im = ax.imshow(cond, cmap="magma", aspect="auto")
+        ax.set_xticks(range(len(SLOW))); ax.set_xticklabels(SLOW); ax.set_xlabel("slow span")
+        ax.set_yticks(range(len(FAST))); ax.set_yticklabels(FAST); ax.set_ylabel("fast span")
+        ax.set_title(f"IC | best span — {ex} · {head}")
+        for i in range(len(FAST)):
+            for j in range(len(SLOW)):
+                if np.isfinite(cond[i, j]): ax.text(j, i, f"{cond[i, j]:+.3f}", ha="center", va="center", color="w", fontsize=7)
+        fig.colorbar(im, ax=ax, fraction=0.046)
+        bi, bj = np.unravel_index(np.nanargmax(np.abs(cond)), cond.shape)          # the most-orthogonal alternative cell (in-sample screen)
+        f1, f2 = chosen, feat(ex, FAST[bi], SLOW[bj])
+        solo, joint = wf_ic([f1], tgt), wf_ic([f1, f2], tgt)                       # OOS: chosen alone vs the pair
+        keep = bool((joint - solo) >= 0.01)                                        # the OOS joint gain DECIDES
+        second[(head, ex)] = (bi, bj) if keep else None
+        print(f"  {ex}: best alt (f={FAST[bi]},s={SLOW[bj]}) IC|best {cond[bi, bj]:+.3f};  OOS joint {joint:+.3f} vs solo {solo:+.3f} (Δ{joint - solo:+.3f})"
+              f"  ->  {'KEEP 2nd span (adds OOS)' if keep else 'one span suffices (no OOS gain)'}")
+fig.suptitle("the family RE-SCORED conditional on the best pick, per head (lit = orthogonal / adds; ~0 = diluted copy of the pick)", y=1.005)
+fig.tight_layout(); plt.show()
+""")
+
+md(r"""
+**Does a *second* time-scale add — per head?** The IC heat-map picks the best span per head; a second span is only
+worth feeding if it carries signal the first doesn't. We test that by **re-scoring the whole family conditional on
+the chosen pick** — each cell's IC recomputed as `partial-IC(cell | chosen)`: its predictive power against the
+head's target **controlling for the span we already picked** (the same partial-IC tool the echo-netting cell
+uses; control = the chosen span). A cell that stays **lit** is **orthogonal** — it adds new signal — while
+a cell that **collapses to ≈ 0** is a diluted copy of the pick. Because that heat-map is **in-sample**, the
+keep/drop **decision** is the overfitting-resistant **walk-forward joint-vs-solo** IC
+(`wf_ic([chosen, alt]) − wf_ic([chosen])`): keep the second span only when the out-of-sample gain clears the ~0.01
+floor. We run it for **both heads** (price → signed feature vs the σ-return target; rate → |feature| vs the count
+target). On this block both find the second span a diluted copy (OOS gain ≈ 0), so one span per head suffices.
 """)
 
 md(r"""
@@ -1029,92 +1103,67 @@ print("  OK — the gate's control path decouples the spurious heavy-tailed rati
 """)
 
 md(r"""
-## How long does the edge last? — the signal's lifetime and your latency budget
+## Is the edge real prediction, or an echo of the move already underway?
 
-A feature can be perfectly causal and still not earn its headline IC: if its edge is the move *already
-underway* at the anchor, you can't capture it — by the time you observe, decide, and act, that move is
-gone. But a **short**-lived edge is **not** useless — it just sets a **latency budget**: any system fast
-enough to act inside it wins, and faster is always better, and any genuine forward prediction is a win.
-So we do **not** gate on this — we **measure how long the signal lasts**.
-
-Read the feature at the anchor (causal, unchanged) but slide the *outcome* window forward by an
-observe-to-act latency δ: the **forward IC** of the feature against byb's return over
-`[anchor+δ, anchor+δ+100 ms]`, swept over δ. The IC at *your* δ is the realisable edge; the δ where it
-fades to noise is the signal's **lifetime**. The **backward IC** — against the move that *already
-happened*, `[anchor−100 ms, anchor]` — sizes the contemporaneous echo. A feature whose forward IC dies at
-δ>0 while the backward IC stays high is re-reporting the past, not predicting it; that is the *only*
-genuinely useless case, and it is measured here, never assumed.
+A feature can be perfectly causal and still not *predict*: if its apparent edge is the price move **already
+underway** at the anchor, you can't capture it — by the time you observe, decide, and act, that move is gone — and
+a purely *contemporaneous* feature can post a positive forward IC from window overlap alone. So before trusting a
+forward IC, **net out the echo**: measure the feature's correlation with the **forward** return
+(`[anchor, anchor+100 ms]`) *controlling for the move that already happened* (`[anchor−100 ms, anchor]`). The
+**backward IC** sizes the echo; the **echo-netted** forward IC is what survives once it's partialled out — the
+genuinely forward-looking edge. (It's the same partial-IC tool §6 uses to test a second time-scale — here the
+control is the trailing move instead of the chosen span.)
 """)
 
 code(r"""
-# Signal lifetime: forward IC vs observe->act latency δ (window slides to [t+δ, t+δ+100ms]), + backward IC.
-rep_ex = OTHERS[0]                                        # one exchange to illustrate; every feature carries its own curve
-DELTAS_MS = [0, 5, 10, 20, 50, 100, 200, 500]
+# Echo-netting: is the edge real prediction, or just re-reporting the move ALREADY underway at the anchor?
+rep_ex = OTHERS[0]                                       # one exchange to illustrate; every feature carries its own
 def _ic(feat, ret):
     v = np.isfinite(feat) & np.isfinite(ret)
     return spearmanr(feat[v], ret[v]).statistic if v.sum() > 100 else float("nan")
 def _mid_at(t):                                          # byb merged mid at-or-before t (causal)
     idx = np.searchsorted(byb_rx, t, "right") - 1; return np.where(idx < 0, np.nan, byb_mid[np.clip(idx, 0, len(byb_mid) - 1)])   # nan before byb's first quote
-def _ret(t0, t1):  return np.log(_mid_at(t1) / _mid_at(t0))
-def _count(t0, t1): return cum_mv[np.searchsorted(byb_rx, t1, "right")] - cum_mv[np.searchsorted(byb_rx, t0, "right")]
-
-signed = price_dislocation(rep_ex, FAST[price_member[rep_ex][0]], SLOW[price_member[rep_ex][1]])   # price head (direction)
-absmag = np.abs(price_dislocation(rep_ex, FAST[rate_member[rep_ex][0]], SLOW[rate_member[rep_ex][1]]))  # rate head (intensity)
-fwd_ic  = [_ic(signed, _ret(anchor_ts + d*1_000_000, anchor_ts + d*1_000_000 + HORIZON_NS)) for d in DELTAS_MS]
-cnt_ic  = [_ic(absmag, _count(anchor_ts + d*1_000_000, anchor_ts + d*1_000_000 + HORIZON_NS)) for d in DELTAS_MS]
-back_ic = _ic(signed, _ret(anchor_ts - HORIZON_NS, anchor_ts))
-# Echo-netted edge — partial rank-IC of the feature with the FORWARD return, CONTROLLING for the trailing
-# (already-happened) return: the part of the edge NOT attributable to the move already underway.
-_trail = _ret(anchor_ts - HORIZON_NS, anchor_ts); _fwd0 = _ret(anchor_ts, anchor_ts + HORIZON_NS)
-def _partial_ic(f, y, t):
+def _ret(t0, t1): return np.log(_mid_at(t1) / _mid_at(t0))
+def _partial_ic(f, y, t):                                # partial rank-IC of f with y, CONTROLLING for t
     v = np.isfinite(f) & np.isfinite(y) & np.isfinite(t)
     if v.sum() <= 100: return float("nan")
     rfy = spearmanr(f[v], y[v]).statistic; rft = spearmanr(f[v], t[v]).statistic; rty = spearmanr(t[v], y[v]).statistic
     return (rfy - rft*rty) / np.sqrt(max((1.0 - rft**2) * (1.0 - rty**2), 1e-12))
-echo_net = _partial_ic(signed, _fwd0, _trail)
 
-fig, ax = plt.subplots(figsize=(7.6, 4.2))
-ax.plot(DELTAS_MS, fwd_ic, "o-", color="C0", label="price head — forward IC (direction)")
-ax.plot(DELTAS_MS, cnt_ic, "s--", color="C3", label="rate head — forward |feature|->count IC")
-ax.axhline(back_ic, color="C0", ls=":", alpha=0.7, label=f"price backward (already-happened) IC = {back_ic:+.3f}")
-ax.axhline(0, color="0.7", lw=0.8); ax.set_xlabel("observe->act latency  δ  (ms)"); ax.set_ylabel("rank-IC")
-ax.set_title(f"signal lifetime — {rep_ex}: edge vs latency δ"); ax.legend(fontsize=8); fig.tight_layout(); plt.show()
-print("price forward IC by δ(ms):", " ".join(f"{d}:{ic:+.3f}" for d, ic in zip(DELTAS_MS, fwd_ic)))
-print(f"price backward (already-happened) IC: {back_ic:+.3f}")
-print(f"echo-netted forward IC (partial, controls for the trailing move): {echo_net:+.3f}  (raw δ=0 {fwd_ic[0]:+.3f}; the shortfall is echo)")
-half = next((d for d, ic in zip(DELTAS_MS, fwd_ic) if np.isfinite(ic) and abs(ic) < abs(fwd_ic[0]) / 2), None)
-print(f"price edge: δ=0 {fwd_ic[0]:+.3f} -> δ=20ms {fwd_ic[3]:+.3f}; drops below half by δ≈{half} ms")
+signed = price_dislocation(rep_ex, FAST[price_member[rep_ex][0]], SLOW[price_member[rep_ex][1]])   # the chosen price-head feature
+_fwd0  = _ret(anchor_ts, anchor_ts + HORIZON_NS)          # forward 100 ms return — what we predict
+_trail = _ret(anchor_ts - HORIZON_NS, anchor_ts)          # the move ALREADY underway at the anchor
+raw_ic   = _ic(signed, _fwd0)                             # raw forward IC
+back_ic  = _ic(signed, _trail)                            # backward IC — sizes the contemporaneous echo
+echo_net = _partial_ic(signed, _fwd0, _trail)             # forward IC NETTED of the echo (controls for the trailing move)
+
+fig, ax = plt.subplots(figsize=(6.4, 4.0))
+labels = ["raw forward\nIC (δ=0)", "backward IC\n(echo size)", "echo-netted\nforward IC"]
+vals = [raw_ic, back_ic, echo_net]
+bars = ax.bar(labels, vals, color=["C0", "0.6", "C2"])
+ax.axhline(0, color="0.7", lw=0.8); ax.set_ylabel("rank-IC"); ax.set_title(f"echo-netting — {rep_ex}, price head")
+for b, v in zip(bars, vals):
+    ax.text(b.get_x() + b.get_width() / 2, v, f"{v:+.3f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
+fig.tight_layout(); plt.show()
+print(f"raw forward IC {raw_ic:+.3f};  backward (echo) IC {back_ic:+.3f};  echo-netted forward IC {echo_net:+.3f}  (the raw->netted shortfall is echo)")
 """)
 
 md(r"""
-**Read it as a latency budget, not a pass/fail.** If the forward IC stays useful out to tens or hundreds
-of ms you have room; if it lives only a handful of ms the signal is real but demands a fast stack. Carry
-this curve for every feature — the verdict is *"predicts ~X ms ahead, needs latency < X,"* never *"drop
-because it's fast."* (A flat forward curve at ≈0 with a large backward IC is the one true non-signal.)
-
-**Sweep the half-life across the *whole* span family, not just the chosen N.** Different lookbacks trade
-IC against half-life: a short N often gives a higher IC with a shorter half-life (a small latency budget),
-a long N a lower IC with a longer half-life (a roomy budget) — and **both are worth keeping**, as separate
-inputs for different latency budgets. So compute IC *and* half-life at **every cell of the §6 family sweep**
-(a half-life heat-map alongside the IC heat-map), and pick per head by the IC×half-life trade-off, not by
-IC alone — a high-IC short-life member and a lower-IC long-life member of the same family are two distinct,
-complementary features.
-
 **Net the echo out — don't report a forward IC a contemporaneous predictor could fake.** The cleanest
-"is this real prediction?" number is the **echo-netted (partial) forward IC**: the feature's rank-IC with
-the *forward* return *controlling for the trailing* `[anchor−100 ms, anchor]` return (printed above). If a
-big raw IC collapses once the trailing move is partialled out, the feature was mostly re-reporting the move
-already underway — report the **netted** number in the verdict, not the raw δ=0 IC.
+"is this real prediction?" number is the **echo-netted (partial) forward IC** above: the feature's rank-IC with
+the *forward* return *controlling for the trailing* `[anchor−100 ms, anchor]` return. If a big raw IC collapses
+once the trailing move is partialled out, the feature was mostly re-reporting the move already underway — report
+the **netted** number in the verdict, not the raw IC. (A near-zero netted IC alongside a large backward IC is the
+one true non-signal: all echo, no prediction.)
 
 **Cross-venue legs: a freshness lead is *real edge*, not an artifact to coarsen away.** The data is recorded
 on a production box in the target datacenter, so each event's `rx_time` is exactly the timing you'd see live —
 there is **no recording/snapshot artifact** to rule out. So when okx's book moves before byb's reflects it
 (byb/okx top-of-book is stale p90 ~100–160 ms vs bin's sub-ms), that lead is **genuine and exploitable**, and
 the *mechanism* (economic price-discovery vs pure latency lead-lag) is irrelevant to P&L. Do **not** coarsen the
-foreign feed to byb's cadence — that throws the edge away. What governs whether you can capture it is the
-**latency budget** (the lifetime IC-by-δ above): act within the signal's half-life. *(A freshness lead would
-only be fake if the recording's cadence didn't match production — e.g. a backtest on vendor snapshots; not the
-case here, where the recording* is *production timing.)*
+foreign feed to byb's cadence — that throws the edge away. *(A freshness lead would only be fake if the
+recording's cadence didn't match production — e.g. a backtest on vendor snapshots; not the case here, where the
+recording* is *production timing.)*
 """)
 
 md(r"""
