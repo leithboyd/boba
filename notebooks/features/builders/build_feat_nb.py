@@ -28,7 +28,7 @@ byb's. When one exchange moves and the others haven't caught up yet, that gap pr
 catch-up. It's a good teacher because it touches every step.
 
 **A feature's *analysis* is done when two checks pass:**
-- **The oracle (§4)** — the code really computes what we think it does.
+- **The parity check (§4)** — a second implementation reproduces the feature on real data, so the code really computes what we think it does.
 - **The hygiene gates (§5)** — the signal is real and holds in any market, not just an echo
   of "the market is volatile right now."
 
@@ -117,7 +117,7 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
   (`σ_ev` or `λ_ev`), so the feature shares units with the target.
 - **Don't trust a correlation** until it survives the regime controls (rate and vol) — else
   it may just be re-reporting "the market is volatile."
-- **Don't ship a feature without the oracle** (§4) matching a dead-simple independent version.
+- **Don't ship a feature without the §4 parity check** — a second, production-style build reproducing it on real data.
 - **Don't peek ahead.** Every value uses only data at-or-before its own timestamp.
 - **Don't over-transform for the network.** Pick the lightest reshaping that works.
 
@@ -126,41 +126,49 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
   would prove it wrong.
 - **Do make every average a trade-tick EMA.** *Every* smoother in the pipeline — the
   dislocation legs, `σ_ev`, `λ_ev`, any rolling statistic — is an exponential moving average
-  **decayed once per trade-timestamp** (`α = 2/(span+1)`) yet **updated on every live event between trades** (a fresh mid, a byb move — never stale), **never** a wall-clock
+  **decayed once per tick of the one shared trade clock** (one tick per trade-timestamp across **all** venues; simultaneous prints count once; `α = 2/(span+1)`) yet **taking in a fresh value at most once per timestamp that carries a relevant event** (a new mid, a byb move — same-timestamp events as one update, never stale between trades), **never** a wall-clock
   average and **never** a hard/boxcar window. That keeps the whole state **O(1)** (one scalar
   per average, no ring buffers) and bit-identical online vs offline. Establish and validate the
   convention against a plain one-event-at-a-time loop on a real block — exactly as
-  `notebooks/03_ema_clock_validation.ipynb` does, and as the §4 oracle re-checks here.
-- **Do make every EMA react to *every* relevant event — never let it read a stale state.** An EMA's
-  *decay* lives on the trade clock, but it must *update* on every event that can change its value,
-  **even between trade ticks**: a gap leg refreshes on every book update; a flow injects on every
-  real move. A value that ignores the events since the last trade is **stale** — wrong, and a silent
+  `notebooks/03_ema_clock_validation.ipynb` does, and as the §4 parity check re-checks here.
+- **Do make every EMA react to relevant events as they land — never let it read a stale state.** An EMA's
+  *decay* lives on the trade clock, but it must *update its value* at **each timestamp that carries a
+  relevant event** (same-timestamp events aggregated to one update), **even between trade ticks**: a gap
+  leg refreshes its front to that timestamp's gap; a flow pushes that timestamp's one sample. A value
+  that ignores the timestamps since the last trade is **stale** — wrong, and a silent
   source of lag. The choice of EMA *and when it updates* is what makes the inter-trade read
   well-behaved — pick both deliberately (see the "Choosing the EMA" section).
-- **Do treat all records sharing a timestamp as ONE event, not a sequence.** A burst of book updates
-  and trades stamped at the *exact same instant* did not arrive in an order — they are **one event
-  carrying many pieces of data**, observed together. Apply them all, *then* register a single update:
-  one mid, one move, one refresh. Imposing an order on a single instant invents motion that never
-  happened *in time* — phantom intra-instant round-trips — which is noise to a level read and outright
-  **wrong** for any path-summing quantity: `σ_ev` counts squared mid-*moves*, so N simultaneous records
-  would fabricate N−1 fake moves and inflate the volatility. (Per-record, σ_ev read **0.13** off; the
-  *same* events collapsed to one update per timestamp made the oracle **bit-exact**.) The decay clock
-  is the only place order matters — and a timestamp with trades advances the clock **once**, not once
-  per print — simultaneous prints are one event.
+- **Do inject at most one EMA sample per timestamp, and decay once per shared-trade-clock tick — this
+  never changes.** At each timestamp an EMA injects **one** sample *iff* a relevant event lands there
+  (for OFI a byb book update; for `σ_ev` a byb mid-move) and **none** if only trades land — nothing to
+  inject — yet it still **ticks** (decays) once *iff* a trade lands, on the one **shared** trade clock
+  (one tick per trade-timestamp across **all** venues, simultaneous prints counting once). Inject and
+  decay are independent and neither ever fires more than once per timestamp, whatever the feature.
+  Records sharing a timestamp are **one** sample, not a sequence: same-timestamp aggregation sets only
+  that sample's **value** — never the number of samples, never the number of ticks. *What* value depends on the quantity: a **level**
+  read takes the *last* state (mid, microprice); a **flow** **sums** the records at that timestamp
+  (trade volume; OFI sums its intra-timestamp increments). So a backed-up burst of N book updates at one
+  instant is still **one** weight-1 sample — value = the final book, or the summed flow — **never** N
+  samples. Injecting N silently overweights exactly the instants where a feed stalled and dumped a burst
+  (N× weight on the `E/W` mean at one timestamp) and corrupts the count `W` that normalises it. The
+  level-read face of the same trap: `σ_ev` counts squared mid-*moves*, so N simultaneous records
+  fabricate N−1 phantom moves and inflate volatility (per-record, σ_ev read **0.13** off; one sample per
+  timestamp made it **bit-exact**). Time-order matters only on the clock — a timestamp with trades
+  advances it **once**, not once per print.
 - **Do always read the *freshest* value — never freeze on the last trade's.** An EMA decays once
   per trade-timestamp (that fixes its memory in trade-count), but its *read* must use the latest data: fold
-  in the current value as of now — every mid-move / book update since the last trade — never the
-  stale snapshot frozen at the last trade tick. Use a trade-weighted EMA with a **live front**:
-  `read = (1 − α)·committed + α·current_value`, current at every instant between trades. Keep the
-  two clocks separate, though: refresh the *read* on every event, but keep the *decay/weighting* on
-  the trade clock — injecting a fresh *sample* once per book update instead *message-rate-weights by quote
-  activity*, which here cost ~0.01–0.02 rank-IC by up-weighting churny stretches the trade clock
-  usefully filters out. (Freshness itself measured ≈neutral for a 100 ms target — so reading fresh
+  in the current value as of now — the latest relevant timestamp (mid-move / book update) since the last
+  trade — never the stale snapshot frozen at the last trade tick. Use a trade-weighted EMA with a **live
+  front**: `read = (1 − α)·committed + α·current_value`, current between trades. Keep the two clocks
+  separate, though: refresh the *read* at each relevant **timestamp**, but keep the *decay/weighting* on
+  the trade clock — push a fresh *sample* once per book-update **timestamp** (one per timestamp, not per
+  message); pushing per message would *message-rate-weight by quote activity*, which here cost ~0.01–0.02
+  rank-IC by up-weighting churny stretches the trade clock usefully filters out. (Freshness itself measured ≈neutral for a 100 ms target — so reading fresh
   costs nothing and is the right default; never deliberately use stale information.)
 - **Do read a sparse flow as `E / W`.** A quantity present on only *some* events (a per-exchange
   trade-flow, or byb's own mid-moves — `σ_ev` is itself such an `E / W`) still needs the
   trade-tick EMA, but as **two** of them — the value `E` and its weight `W`, both decayed every
-  event yet each updated only on its own events — read as the ratio `E / W`, which cancels the
+  trade-timestamp yet each pushed a sample only at the timestamps carrying its own events — read as the ratio `E / W`, which cancels the
   in-between decay and the warm-up bias. Dividing by `W` cancels the foreign-event decay exactly,
   so an `E / W` on the **combined** trade clock at span `N` approximates that exchange's **own**-clock
   EMA at a rescaled span — roughly `N` times that exchange's share of the combined trade rate — i.e. you get genuine per-exchange stats from the one shared clock. (That
@@ -229,11 +237,11 @@ md(r"""
 ## Choosing the EMA — the part that's easy to get silently wrong
 
 Every smoother here is an EMA on the **trade clock**: its **decay** steps once per *trade-timestamp*
-(`α = 2/(span+1)`), but its **value updates on every event in between**, so a read between trades is
+(`α = 2/(span+1)`), but its **value updates at most once per timestamp in between** (same-timestamp events as one update), so a read between trades is
 never stale. That
 looks like plumbing, but two choices decide whether the EMA is even *correct*, and a wrong choice fails
 **silently** — a plausible-looking number that measures the wrong thing or lags the market. So make
-both deliberately for every feature, and let the §4 oracle catch you if you slip.
+both deliberately for every feature, and let the §4 parity check catch you if you slip.
 
 **Choice 1 — which EMA, and how you read it** (`boba.ema`):
 
@@ -254,7 +262,7 @@ the same numbers**:
 
 | push rule | what it weights / measures | use for |
 |---|---|---|
-| commit every trade-timestamp; read refreshes every book update | by **trade-dwell** — a value spanning more trades counts more | a level (gap, price) |
+| commit every trade-timestamp; read refreshes each book-update timestamp | by **trade-dwell** — a value spanning more trades counts more | a level (gap, price) |
 | only on a real event, skip the rest | a **per-real-event mean**; non-events are *non-observations*, not zeros | a flow (vol: push `r²` only on a move) |
 | only when the value changes | each **distinct value equally** — discards dwell, over-weights flickers | — (measured *worse* for a level) |
 | every message, change or not | by **message rate** — up-weights chatty / churny stretches | — (measured *worst*) |
@@ -266,15 +274,15 @@ measurably lowered rank-IC on a real block.
 
 Two rules keep the read correct **between** trades — the regime where this is easiest to get wrong:
 
-- **React to every relevant event, and read the freshest value.** Decay rides the trade clock, but the
-  EMA must *update* on every event that can move it, and the read must reflect the events since the last
+- **React at every relevant timestamp, and read the freshest value.** Decay rides the trade clock, but the
+  EMA must *update* at every timestamp that can move it (same-timestamp events as one update), and the read must reflect the timestamps since the last
   trade — never a stale snapshot. Why fresh is the default even when it measures ≈neutral: the cost is
   *asymmetric*. When trades are dense the last-trade snapshot is barely stale, so freshness is free; when
   trades are sparse a stale read lags badly — and you can't know in advance which regime a future block
   is in.
-- **Records sharing a timestamp are ONE event, not a sequence** — apply them all, then register a single
+- **Records sharing a timestamp are ONE update, not a sequence** — apply them all, then register a single
   update (one mid, one move, one refresh). Treating them as a sequence invents motion that never happened
-  in time. (Both rules are in the guard rails; the §4 oracle enforces them.)
+  in time. (Both rules are in the guard rails; the §4 parity check enforces them.)
 """)
 
 md(r"""
@@ -287,7 +295,7 @@ forward-fill is the usual way to break this by accident.)
 
 **Measured on the trade clock** — markets alternate busy and quiet, so we count progress in *trades*
 (one tick per trade-timestamp on any exchange — simultaneous prints are one tick) rather than in clock-seconds; that keeps the feature's meaning
-steady whether trading is fast or slow. Book updates between trades refresh what the EMA *reads*, but
+steady whether trading is fast or slow. Book-update timestamps between trades refresh what the EMA *reads*, but
 they do **not** advance the clock — only a trade does, decaying each EMA once.
 
 **Comparable across calm and wild markets** — a raw price gap is simply bigger when the market is
@@ -311,7 +319,7 @@ the rest is making each piece correct.
 - **The gap legs** (`fast`, `slow`) are a **forward-filled level** — the gap has a value at every
   instant — so each leg is a **`LiveFrontEMA`** read as a **live front**: `(1 − α)·(value committed at
   the last trade) + α·(the gap right now)`. We **commit** the gap once per trade-timestamp (trade-dwell weighting,
-  the right average for a level) and **refresh** the live front on every book update, so the read is
+  the right average for a level) and **refresh** the live front at each book-update timestamp, so the read is
   current between trades, never frozen. `n_fast = 1` sets `α = 1`, collapsing that leg to the fresh gap
   itself (no smoothing). One subtlety: both legs read the *same* fresh gap, so it does **not** fully
   cancel in the difference — `fast − slow` keeps a `(α_fast − α_slow)·gap` term, the freshest-gap kick
@@ -445,7 +453,7 @@ for ex in OTHERS:
     gap_committed[ex] = np.nan_to_num(g, nan=0.0)                              # no committed gap until both venues have quoted — neutral, and decayed away by WARMUP anyway
 def _mid_at(ex, t):                                                # a venue's mid forward-filled to arbitrary times (for the FRESH gap)
     rx, mid = mids[ex]; idx = np.searchsorted(rx, t, "right") - 1; return np.where(idx < 0, np.nan, mid[np.clip(idx, 0, len(mid) - 1)])   # nan before first quote; the finite-mask drops such rows
-gap_anchor = {ex: np.log(_mid_at(ex, anchor_ts)) - np.log(_mid_at("byb", anchor_ts)) for ex in OTHERS}   # the gap as of each grid anchor — every book update, never stale
+gap_anchor = {ex: np.log(_mid_at(ex, anchor_ts)) - np.log(_mid_at("byb", anchor_ts)) for ex in OTHERS}   # the gap as of each grid anchor — latest book-update timestamp, never stale
 def ema(gap, N):
     if N == 1: return gap                                          # all weight on the latest tick
     a = 2.0 / (N + 1.0); return lfilter([a], [1.0, -(1.0 - a)], gap)
@@ -575,7 +583,7 @@ print(f"streaming {len(rxL):,} raw events (book + trades, all venues) over ~{N_G
 
 # --- the CALLER drives it: apply each timestamp's events, refresh() once per timestamp, and READ value() at every grid anchor ---
 # (the builder stores nothing and has no callback — when to tick/read lives entirely out here). We read AT the anchor —
-# after every book update up to it — so the live front is genuinely fresh, never the value frozen at the last trade.
+# after every book-update timestamp up to it — so the live front is genuinely fresh, never the value frozen at the last trade.
 fuse = {f"{ex}_{COIN}" for ex in ("byb", "okx", "bin") if MID_STREAM[ex] == "merged_levels"}   # byb,okx merged; bin book-only
 feat = LiveDislocation(TARGET, [LISTINGS[1], LISTINGS[2]], NF, NS, YARDSTICK_N, fuse)           # others: okx, bin
 na = min(N_GRID, len(anchor_ts))                                                                # the validated grid slice
@@ -1280,7 +1288,7 @@ yardstick; the move-count it predicts is divided by the rate yardstick.
 
 **To ship:**
 - [ ] the streaming (constant-work-per-trade) builder, matching this analysis version
-- [ ] the oracle (§4) and tests, passing
+- [ ] the tests, passing
 - [ ] the gate results recorded (with any failures justified)
 - [ ] the chosen heads and time-scales written down, with the yardstick spans
 - [ ] the data quirks handled (bad zero-price prints; the right price source per exchange)
