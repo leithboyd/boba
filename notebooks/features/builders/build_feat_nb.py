@@ -96,7 +96,7 @@ and the rate head learns the magnitude (and how features cancel or reinforce) on
 are **marginal screens** — does the feature carry signal worth feeding — **not** measures of
 distributional fit: the model's actual targets are the count distribution `P(K = k)` and the
 count-conditioned price family `D_k` mixed above, fit downstream, not what these rank-ICs measure
-(§7 inspects the realised count/return distributions by feature bucket).
+(§7 shows the fixed-count price and rate IC breakdowns used for span selection).
 """)
 
 md(r"""
@@ -354,6 +354,7 @@ flows on that clock, span `YARDSTICK_N`.
 code(r"""
 import numpy as np, polars as pl
 import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
 from scipy.signal import lfilter
 from scipy.stats import spearmanr
 from boba.io import list_blocks, load_block
@@ -365,10 +366,12 @@ OTHERS      = ["bin", "okx"]                      # the other exchanges; each on
 # with trades for a fresher mid. byb/okx use merged_levels; bin MUST use front_levels — merged_levels is DISALLOWED for
 # bin perp in boba.io (it raises). This is a policy, not a tuning choice.
 MID_STREAM  = {"bin": "front_levels", "byb": "merged_levels", "okx": "merged_levels"}
-FAST        = [1, 10, 50, 200]                   # fast-EMA spans to sweep (1 = no smoothing)
-SLOW        = [100, 500, 2000, 5000]             # slow-EMA spans (each must exceed the fast one)
+FAST        = [1, 10, 50, 200, 500, 1000]        # fast-EMA spans to sweep (1 = no smoothing)
+SLOW        = [100, 500, 1000, 2000, 5000, 10000]  # slow-EMA spans (each must exceed the fast one)
 HORIZON_NS  = 100 * 1_000_000                    # how far ahead we predict (100 ms, in nanoseconds)
+PRICE_MOVE_COUNTS = [1, 3, 6, 9]                 # fixed byb move counts for price-head IC diagnostics
 YARDSTICK_N = 10000                              # the ONE span for BOTH yardsticks (σ_ev, λ_ev): an EMA on the trade-tick clock (α=2/(N+1)) — fixed, used for every feature
+N_JOBS      = 18                                  # parallel workers for independent sweep cells
 block       = list_blocks(TARGET, "front_levels")[0]   # one ~24h slice of recorded data
 
 # load each exchange's mid-price stream (rows already arrive in time order)
@@ -408,7 +411,7 @@ byb_blr = np.empty_like(byb_lm); byb_blr[0] = 0.0; byb_blr[1:] = np.diff(byb_lm)
 mv = byb_blr != 0.0                                                              # a REAL byb mid-move: ONE per timestamp where the mid changed
 mv_rx, mv_r2 = byb_rx[mv], byb_blr[mv] ** 2                                       # move times + squared returns
 cum_mv = np.concatenate([[0.0], np.cumsum(mv.astype(float))])                    # running count of byb mid-moves (rate-head target)
-byb_dt = np.zeros(n_ticks); byb_dt[1:] = np.diff(merged_ts) / 1e9                # seconds between consecutive trades (per-trade)
+clock_dt = np.zeros(n_ticks); clock_dt[1:] = np.diff(merged_ts) / 1e9            # seconds between consecutive SHARED trade-clock ticks (all venues), not byb-specific
 def _ewma(x, span):                                                # per-trade EMA (for the seconds-per-trade leg of λ_ev)
     a = 2.0 / (span + 1.0); return lfilter([a], [1.0, -(1.0 - a)], x)
 def _flow_at(anchors, val, span):           # EWMA of `val` over the byb-MOVE stream, decayed once per trade-timestamp, read AT each anchor
@@ -424,7 +427,7 @@ def _flow_at(anchors, val, span):           # EWMA of `val` over the byb-MOVE st
 def yardsticks(anchors, span):                                     # σ_ev, λ_ev — defined AT the anchor, reacting to every byb mid-move
     e_sq = _flow_at(anchors, mv_r2, span)                          # E: exp-weighted squared byb moves
     e_mv = _flow_at(anchors, np.ones(mv_r2.size), span)           # W: exp-weighted byb-move count
-    e_dt = _ewma(byb_dt, span)[np.searchsorted(merged_ts, anchors, "right") - 1]  # seconds/trade (per-trade, held flat between trades)
+    e_dt = _ewma(clock_dt, span)[np.searchsorted(merged_ts, anchors, "right") - 1]  # seconds/trade (per-trade, held flat between trades)
     sig = np.sqrt(e_sq / np.maximum(e_mv, 1e-12))                 # σ_ev: RMS byb mid-move (E/W — non-moves cancel)
     lam = e_mv / np.maximum(e_dt, 1e-12)                          # λ_ev: byb mid-moves per second
     return sig, lam
@@ -447,15 +450,28 @@ next 100 ms (the thing we're predicting), and compute the feature at each grid p
 code(r"""
 # evaluation grid (causal) + forward target in shared σ-units
 WARMUP = 5 * max(YARDSTICK_N, max(SLOW))   # = 50000: enough trades for the slowest EMA/yardstick to converge
+assert n_ticks > WARMUP, f"block too thin: {n_ticks:,} trade ticks ≤ WARMUP {WARMUP:,} — use a longer block or smaller spans (SLOW/YARDSTICK_N)"
 anchor_ts      = np.arange(merged_ts[WARMUP], merged_ts[-1] - HORIZON_NS, 50 * 1_000_000)   # 50 ms grid, past warmup (EMAs + yardsticks)
 tick_at_anchor = np.searchsorted(merged_ts, anchor_ts, "right") - 1                         # last trade-clock tick <= anchor
 sigma_at_anchor, lam_at_anchor = yardsticks(anchor_ts, YARDSTICK_N)   # both yardsticks at each grid point (the same span-YARDSTICK_N trade-tick EMA)
 print(f"σ_ev median {np.nanmedian(sigma_at_anchor):.2e},  λ_ev median {np.nanmedian(lam_at_anchor):.2f} moves/s")
 
-mid_now    = byb_mid[np.searchsorted(byb_rx, anchor_ts, "right") - 1]
-mid_fwd    = byb_mid[np.searchsorted(byb_rx, anchor_ts + HORIZON_NS, "right") - 1]
+_inow = np.searchsorted(byb_rx, anchor_ts, "right") - 1
+_ifwd = np.searchsorted(byb_rx, anchor_ts + HORIZON_NS, "right") - 1
+mid_now    = np.where(_inow < 0, np.nan, byb_mid[np.clip(_inow, 0, len(byb_mid) - 1)])   # nan before byb's first quote — no byb_mid[-1] wrap (guarded like mid_on_clock/_mid_at)
+mid_fwd    = np.where(_ifwd < 0, np.nan, byb_mid[np.clip(_ifwd, 0, len(byb_mid) - 1)])
 fwd_return = np.log(mid_fwd / mid_now)
-target     = fwd_return / sigma_at_anchor                          # byb's 100 ms return ÷ σ_ev — the price head's target (regime-normalised, σ-units)
+target     = fwd_return / sigma_at_anchor                          # byb's 100 ms return ÷ σ_ev — the unchanged 100 ms price-gate target
+
+move_rows = np.flatnonzero(mv)                                      # rows in byb_rx/byb_mid where byb made a real mid-move
+move_rx, move_lm = byb_rx[move_rows], byb_lm[move_rows]
+fixed_move_target = {}
+for n in PRICE_MOVE_COUNTS:
+    nth = np.searchsorted(move_rx, anchor_ts, "right") + n - 1       # nth future byb mid-move after the anchor
+    ok = nth < len(move_lm)
+    ret_n = np.full(len(anchor_ts), np.nan)
+    ret_n[ok] = move_lm[nth[ok]] - np.log(mid_now[ok])
+    fixed_move_target[n] = ret_n / sigma_at_anchor                   # count-conditioned price target: signed n-move return ÷ σ_ev
 
 gap_committed = {}                                                             # each other's log gap vs byb, on the trade clock (the committed legs)
 for ex in OTHERS:
@@ -569,7 +585,7 @@ class LiveDislocation:
         return {o: (self.leg_f[o].value() - self.leg_s[o].value()) / sig for o in self.others}
 
 # --- gather the WHOLE raw stream (every venue's book updates + trades) over a slice; no merged_levels anywhere ---
-NF, NS, N_GRID = 10, 100, 200_000                  # validate BOTH gaps (byb↔okx, byb↔bin) over the first ~N_GRID grid points
+PARITY_SPANS, N_GRID = [(1, 100), (10, 100)], 200_000   # validate BOTH gaps (byb↔okx, byb↔bin) at n_fast=1 (the α=1 / no-smoothing short-circuit) AND a smoothed pair, over the first ~N_GRID grid points
 cutoff = int(anchor_ts[min(N_GRID, len(anchor_ts) - 1)])    # wall-clock time of the N_GRID-th grid anchor
 LISTINGS = [f"{ex}_{COIN}" for ex in ("byb", "okx", "bin")] # 0=byb, 1=okx, 2=bin — integer codes keep the event arrays numeric & fast
 cols = {k: [] for k in "rx kind lid t a b".split()}
@@ -595,42 +611,52 @@ print(f"streaming {len(rxL):,} raw events (book + trades, all venues) over ~{N_G
 # (the builder stores nothing and has no callback — when to tick/read lives entirely out here). We read AT the anchor —
 # after every book-update timestamp up to it — so the live front is genuinely fresh, never the value frozen at the last trade.
 fuse = {f"{ex}_{COIN}" for ex in ("byb", "okx", "bin") if MID_STREAM[ex] == "merged_levels"}   # byb,okx merged; bin book-only
-feat = LiveDislocation(TARGET, [LISTINGS[1], LISTINGS[2]], NF, NS, YARDSTICK_N, fuse)           # others: okx, bin
 na = min(N_GRID, len(anchor_ts))                                                                # the validated grid slice
-streams = {o: np.full(na, np.nan) for o in ("okx", "bin")}
+# Drive the SAME raw stream through every span pair's builder in ONE pass — including n_fast=1, the α=1
+# / no-smoothing leg that is special-cased on BOTH sides (§3 ema() short-circuits to the fresh gap;
+# LiveFrontEMA(1) has α=1 so value()==latest) and is the most-used span, so it must be parity-checked too.
+feats   = [LiveDislocation(TARGET, [LISTINGS[1], LISTINGS[2]], nf, ns, YARDSTICK_N, fuse) for nf, ns in PARITY_SPANS]  # others: okx, bin
+streams = [{o: np.full(na, np.nan) for o in ("okx", "bin")} for _ in PARITY_SPANS]
 n = len(rxL); i = 0; ai = 0
 while i < n:                                        # walk the stream, grouped by receive-timestamp
     rx = rxL[i]
     while ai < na and anchor_ts[ai] < rx:          # read every anchor whose state is settled (all events before rx applied)
-        v = feat.value()
-        for o in ("okx", "bin"): streams[o][ai] = v[f"{o}_{COIN}"]
+        for s, feat in zip(streams, feats):
+            v = feat.value()
+            for o in ("okx", "bin"): s[o][ai] = v[f"{o}_{COIN}"]
         ai += 1
-    while i < n and rxL[i] == rx:                  # apply EVERY event stamped at this nanosecond (no half-applied timestamp)
-        if kindL[i] == 0: feat.on_book(LISTINGS[lidL[i]], tL[i], aL[i], bL[i])
-        else:             feat.on_trade(LISTINGS[lidL[i]], tL[i], aL[i], bL[i])
+    while i < n and rxL[i] == rx:                  # apply EVERY event stamped at this nanosecond to every builder (no half-applied timestamp)
+        for feat in feats:
+            if kindL[i] == 0: feat.on_book(LISTINGS[lidL[i]], tL[i], aL[i], bL[i])
+            else:             feat.on_trade(LISTINGS[lidL[i]], tL[i], aL[i], bL[i])
         i += 1
-    feat.refresh()                                 # apply the timestamp: update EMAs, then advance the clock ONCE if any trade landed (one decay per timestamp, not per print)
+    for feat in feats: feat.refresh()              # one refresh per builder per timestamp: update EMAs, advance the clock ONCE if any trade landed
 while ai < na:                                     # trailing anchors after the last event
-    v = feat.value()
-    for o in ("okx", "bin"): streams[o][ai] = v[f"{o}_{COIN}"]
+    for s, feat in zip(streams, feats):
+        v = feat.value()
+        for o in ("okx", "bin"): s[o][ai] = v[f"{o}_{COIN}"]
     ai += 1
 
-# --- one stream -> two live-front features: check EACH gap against its §3 vectorized feature ---
-print(f"one raw-event stream -> two live-front features, vs the vectorized build (Nf={NF}, Ns={NS}):")
-for o in ("okx", "bin"):
-    ref = price_dislocation(o, NF, NS)[:na]
-    both = np.isfinite(streams[o]) & np.isfinite(ref)
-    diff = np.abs(streams[o][both] - ref[both])
-    print(f"  byb<->{o}:  max |diff| {np.nanmax(diff):.2e}  on {int(both.sum()):,} grid points")
-    assert np.nanmax(diff) < 1e-6, f"live build does not reproduce the byb<->{o} feature"
-print("parity: one raw-event stream reproduces BOTH gaps  OK")
+# --- one stream -> live-front features per span pair: check EACH gap against its §3 vectorized feature ---
+print("one raw-event stream -> live-front features, vs the vectorized build, per span pair:")
+for (nf, ns), s in zip(PARITY_SPANS, streams):
+    for o in ("okx", "bin"):
+        ref = price_dislocation(o, nf, ns)[:na]
+        both = np.isfinite(s[o]) & np.isfinite(ref)
+        diff = np.abs(s[o][both] - ref[both])
+        print(f"  Nf={nf:>2} Ns={ns}  byb<->{o}:  max |diff| {np.nanmax(diff):.2e}  on {int(both.sum()):,} grid points")
+        assert np.nanmax(diff) < 1e-6, f"live build does not reproduce byb<->{o} at (Nf={nf}, Ns={ns})"
+print("parity: one raw-event stream reproduces BOTH gaps at every checked span (incl. n_fast=1)  OK")
 """)
 
 md(r"""
 **Conclusion.** From one stream of ~8 M raw events the builder reproduces **both** vectorized features to
-floating-point precision — max |diff| ~4e-13 over ~200k grid points per gap, pure round-off from the
-EMAs' recursive last-digit drift. The production shape (one feed in, a feature *per gap* out) computes
-exactly what the offline analysis did, on the one shared trade clock — so the two implementations compute the same feature.
+floating-point precision — max |diff| ~4e-13 over ~200k grid points per gap for the smoothed pair, pure
+round-off from the EMAs' recursive last-digit drift. The **n_fast=1** (α=1) no-smoothing leg is parity-checked
+too and agrees to the same round-off floor *by construction*: its fast leg collapses to the exact fresh gap on
+both sides (zero recursion), so any drift comes only from the shared slow leg. The production shape (one feed
+in, a feature *per gap* out) computes exactly what the offline analysis did, on the one shared trade clock — so
+the two implementations compute the same feature.
 """)
 
 md(r"""
@@ -737,30 +763,16 @@ That's what makes the "added over the controls" gates below a fair test.
 """)
 
 md(r"""
-## 6. Two choices: which time-scale per head, and which exchanges to keep
+## 6. Prepare the span candidates for the gates
 
-A feature is rarely a single number — it's a **family** across time-scales (here, every
-fast/slow pair). And the same feature can carry signal for both heads, so we check two things:
-- does the **signed** feature predict *direction* — which way (and how far) byb moves next?
-- does its **magnitude** predict *intensity* — *how many* moves byb makes next?
+The gates below need concrete fast/slow span choices before they can score the feature. This cell
+builds the full span family once, caches every per-exchange feature, computes the IC grids used for
+span selection, and records the selected span for each diagnostic. The IC breakdown itself is shown
+after the gates and echo-netting, so the notebook first answers "does this feature pass?" and only
+then shows the span-family detail.
 
-The magnitude check is a **diagnostic only**: the model is fed the *signed* feature for both
-heads (see the guard rails) — pre-taking `|·|` per exchange would stop the rate head learning
-that opposing gaps cancel. The two signals usually live at different time-scales — direction a
-smoother, slower feature; intensity a sharp, immediate one — so we sweep the whole family, for
-**every exchange**, against both targets, and draw it as heat-maps. We keep *all* exchanges
-(never pick one); the only thing we choose is the best time-scale, **per head**.
-
-**How many exchanges to keep is itself time-scale-dependent.** The cross-exchange edge is an
-**arbitrage lead/lag** — one venue ticking before another — and that mispricing is closed within
-milliseconds. So at **short** time-scales the venues genuinely differ (who's leading whom) and the
-signal is worth keeping **per-exchange**; at **long** time-scales the lead/lag is long gone, every
-venue carries the *same* drift, and a **single** exchange already says what the rest do — the extra
-copies are redundant. Keep all exchanges as the safe default, but what they *add* over one shrinks as
-the scale grows (§9 sweeps that cross-over explicitly).
-
-The rate-head target is the count of byb's moves over the next 100 ms, divided by its recent
-move-rate `λ_ev` — i.e. "more or fewer moves than usual," using the rate yardstick.
+The gate analysis deliberately keeps the existing 100 ms price target. The fixed-count price-head IC
+diagnostics use `PRICE_MOVE_COUNTS` and are displayed later.
 """)
 
 code(r"""
@@ -771,99 +783,46 @@ rate_target = fwd_count / np.maximum(lam_at_anchor, 1e-9)   # count ÷ λ_ev ∝
 
 # Sweep the family for EVERY exchange, BOTH heads, treating exchanges symmetrically (no assumed leader).
 # Which exchange carries signal, and when, varies over time -> let the sweep show it; never hard-code one.
-price_grid = {ex: np.full((len(FAST), len(SLOW)), np.nan) for ex in OTHERS}   # signed feature -> byb's signed return
-rate_grid  = {ex: np.full((len(FAST), len(SLOW)), np.nan) for ex in OTHERS}   # |feature|      -> byb's move count
-for ex in OTHERS:
-    for i, nf in enumerate(FAST):
-        for j, ns in enumerate(SLOW):
-            if nf >= ns: continue
-            d = price_dislocation(ex, nf, ns)
-            price_grid[ex][i, j] = spearmanr(d, target).statistic            # predictive power for the price head
-            rate_grid[ex][i, j]  = spearmanr(np.abs(d), rate_target).statistic  # rate head — |feature|→count is a univariate DIAGNOSTIC; the model is fed signed d
-
-fig, axes = plt.subplots(2, len(OTHERS), figsize=(5.6 * len(OTHERS), 8.4), squeeze=False)
-for row, (grids, head) in enumerate([(price_grid, "price head: signed -> return"), (rate_grid, "rate head: |feature| -> move count")]):
-    for col, ex in enumerate(OTHERS):
-        ax = axes[row][col]; grid = grids[ex]; im = ax.imshow(grid, cmap="viridis", aspect="auto")
-        ax.set_xticks(range(len(SLOW))); ax.set_xticklabels(SLOW); ax.set_xlabel("slow span")
-        ax.set_yticks(range(len(FAST))); ax.set_yticklabels(FAST); ax.set_ylabel("fast span")
-        ax.set_title(f"{head}  —  {ex}")
-        for i in range(len(FAST)):
-            for j in range(len(SLOW)):
-                if np.isfinite(grid[i, j]): ax.text(j, i, f"{grid[i, j]:.3f}", ha="center", va="center", color="w", fontsize=7)
-        fig.colorbar(im, ax=ax, fraction=0.046)
-fig.suptitle("predictive power across the time-scale family — every exchange, both heads (fast span=1 means no smoothing)", y=1.01)
-fig.tight_layout(); plt.show()
+valid_members = [(i, j, nf, ns) for i, nf in enumerate(FAST) for j, ns in enumerate(SLOW) if nf < ns]
+cache_jobs = [(ex, nf, ns) for ex in OTHERS for _, _, nf, ns in valid_members]
+def _build_cached_feature(job):
+    ex, nf, ns = job
+    return job, price_dislocation(ex, nf, ns)
+with ThreadPoolExecutor(max_workers=N_JOBS) as pool:
+    feat_cache = dict(pool.map(_build_cached_feature, cache_jobs))
+price_gate_grid = {ex: np.full((len(FAST), len(SLOW)), np.nan) for ex in OTHERS}   # unchanged 100 ms selector for the gate cells below
+price_signed_grid = {n: {ex: np.full((len(FAST), len(SLOW)), np.nan) for ex in OTHERS} for n in PRICE_MOVE_COUNTS}
+price_mag_grid    = {n: {ex: np.full((len(FAST), len(SLOW)), np.nan) for ex in OTHERS} for n in PRICE_MOVE_COUNTS}
+rate_grid         = {ex: np.full((len(FAST), len(SLOW)), np.nan) for ex in OTHERS}   # |feature| -> byb's move count
+score_jobs = [(ex, i, j, nf, ns) for ex in OTHERS for i, j, nf, ns in valid_members]
+def _score_member(job):
+    ex, i, j, nf, ns = job
+    d = feat_cache[(ex, nf, ns)]
+    abs_d = np.abs(d)
+    signed_scores, mag_scores = {}, {}
+    for n in PRICE_MOVE_COUNTS:
+        y = fixed_move_target[n]
+        signed_scores[n] = ic(d, y)
+        mag_scores[n] = ic(abs_d, np.abs(y))
+    return ex, i, j, ic(d, target), signed_scores, mag_scores, ic(abs_d, rate_target)   # masked gate primitive (boba.research.gates.ic) — drops non-finite rows, like the signed/mag scores above
+with ThreadPoolExecutor(max_workers=N_JOBS) as pool:
+    for ex, i, j, price_gate, signed_scores, mag_scores, rate_score in pool.map(_score_member, score_jobs):
+        price_gate_grid[ex][i, j] = price_gate       # keep gate analysis on the existing 100 ms price target
+        for n in PRICE_MOVE_COUNTS:
+            price_signed_grid[n][ex][i, j] = signed_scores[n]
+            price_mag_grid[n][ex][i, j] = mag_scores[n]
+        rate_grid[ex][i, j] = rate_score             # rate head — |feature|→count is a univariate DIAGNOSTIC; the model is fed signed d
 
 # We do NOT pick an exchange (not "the best", not assumed). Every exchange's feature is kept; the model weights
 # whichever is leading at the moment. Choosing the best time-scale PER exchange is fine; choosing an exchange is not.
-# NB: each grid cell is an IN-SAMPLE spearmanr(d, target) and best_member is the nanargmax over it (in-sample maximisation) — this is
-# used ONLY to PICK a time-scale, not to claim out-of-sample power. The chosen feature is then re-scored OUT-OF-SAMPLE by the §5
-# walk-forward gates below, and that is the number that counts.
+# NB: each grid cell is an IN-SAMPLE Spearman diagnostic and best_member is the nanargmax over it
+# (in-sample maximisation) — used ONLY to PICK a time-scale, not to claim out-of-sample power.
+# The gate cells below deliberately keep their existing 100 ms price target.
 def best_member(grid): return np.unravel_index(np.nanargmax(grid), grid.shape)    # best (fast, slow) spans for THIS exchange (in-sample pick)
-price_member = {ex: best_member(price_grid[ex]) for ex in OTHERS}                  # one signed feature per exchange (price head)
-rate_member  = {ex: best_member(rate_grid[ex])  for ex in OTHERS}                  # one feature per exchange (rate head) — its span is PICKED here by the |feature|→count heat-map (in-sample, like the price pick), then the rate-SPAN feature is put through its OWN Gate A/B below (the rate-head gate cell), against the COUNT target — its verdict is not inherited from the price gates
-print("kept features (one per exchange, all fed to the model — none privileged):")
-for ex in OTHERS:
-    pi, pj = price_member[ex]; ri, rj = rate_member[ex]
-    print(f"  {ex}:  price head (fast={FAST[pi]}, slow={SLOW[pj]}) power={price_grid[ex][pi, pj]:.3f}"
-          f"   |  rate head (fast={FAST[ri]}, slow={SLOW[rj]}) power={rate_grid[ex][ri, rj]:.3f}")
-
-# === Does a SECOND time-scale ADD over the pick? — the sweep RE-SCORED conditional on the best member, PER HEAD ===
-# Selection lives here in §6. We picked the best span per head by IC; now re-score the WHOLE family as
-# partial-IC(cell | chosen) -- each cell's IC against the head's target, CONTROLLING for the span we picked (the
-# same partial-IC tool the echo-netting cell uses; control = the chosen span, not the trailing move).
-# A cell still LIT adds signal ORTHOGONAL to the pick; a cell that COLLAPSES to ~0 is a diluted copy. The heat-map
-# is in-sample, so the keep/drop DECISION is the walk-forward joint-vs-solo OOS IC (wf_ic, imported in §5).
-def _pic(f, y, c):                                                   # partial rank-IC of f with y, controlling for c
-    m = np.isfinite(f) & np.isfinite(y) & np.isfinite(c)
-    if m.sum() <= 100: return np.nan
-    rfy = spearmanr(f[m], y[m]).statistic; rfc = spearmanr(f[m], c[m]).statistic; rcy = spearmanr(c[m], y[m]).statistic
-    return (rfy - rfc * rcy) / np.sqrt(max((1.0 - rfc**2) * (1.0 - rcy**2), 1e-12))
-
-# Per head: feat() maps a cell to its scored feature, tgt is the head's target, member is the in-sample pick.
-HEADS = [("price head", lambda ex, nf, ns: price_dislocation(ex, nf, ns),         target,      price_member),
-         ("rate head",  lambda ex, nf, ns: np.abs(price_dislocation(ex, nf, ns)), rate_target, rate_member)]
-fig, axes = plt.subplots(len(HEADS), len(OTHERS), figsize=(5.6 * len(OTHERS), 4.2 * len(HEADS)), squeeze=False)
-second = {}
-for row, (head, feat, tgt, member) in enumerate(HEADS):
-    print(f"does a 2nd span add over the pick? — {head}: conditional partial-IC (in-sample screen) + walk-forward joint-vs-solo OOS:")
-    for col, ex in enumerate(OTHERS):
-        ci, cj = member[ex]; chosen = feat(ex, FAST[ci], SLOW[cj])
-        cond = np.full((len(FAST), len(SLOW)), np.nan)
-        for i, nf in enumerate(FAST):
-            for j, ns in enumerate(SLOW):
-                if nf < ns: cond[i, j] = 0.0 if (i, j) == (ci, cj) else _pic(feat(ex, nf, ns), tgt, chosen)
-        ax = axes[row][col]; im = ax.imshow(cond, cmap="magma", aspect="auto")
-        ax.set_xticks(range(len(SLOW))); ax.set_xticklabels(SLOW); ax.set_xlabel("slow span")
-        ax.set_yticks(range(len(FAST))); ax.set_yticklabels(FAST); ax.set_ylabel("fast span")
-        ax.set_title(f"IC | best span — {ex} · {head}")
-        for i in range(len(FAST)):
-            for j in range(len(SLOW)):
-                if np.isfinite(cond[i, j]): ax.text(j, i, f"{cond[i, j]:+.3f}", ha="center", va="center", color="w", fontsize=7)
-        fig.colorbar(im, ax=ax, fraction=0.046)
-        bi, bj = np.unravel_index(np.nanargmax(np.abs(cond)), cond.shape)          # the most-orthogonal alternative cell (in-sample screen)
-        f1, f2 = chosen, feat(ex, FAST[bi], SLOW[bj])
-        solo, joint = wf_ic([f1], tgt), wf_ic([f1, f2], tgt)                       # OOS: chosen alone vs the pair
-        keep = bool((joint - solo) >= 0.01)                                        # the OOS joint gain DECIDES
-        second[(head, ex)] = (bi, bj) if keep else None
-        print(f"  {ex}: best alt (f={FAST[bi]},s={SLOW[bj]}) IC|best {cond[bi, bj]:+.3f};  OOS joint {joint:+.3f} vs solo {solo:+.3f} (Δ{joint - solo:+.3f})"
-              f"  ->  {'KEEP 2nd span (adds OOS)' if keep else 'one span suffices (no OOS gain)'}")
-fig.suptitle("the family RE-SCORED conditional on the best pick, per head (lit = orthogonal / adds; ~0 = diluted copy of the pick)", y=1.005)
-fig.tight_layout(); plt.show()
-""")
-
-md(r"""
-**Does a *second* time-scale add — per head?** The IC heat-map picks the best span per head; a second span is only
-worth feeding if it carries signal the first doesn't. We test that by **re-scoring the whole family conditional on
-the chosen pick** — each cell's IC recomputed as `partial-IC(cell | chosen)`: its predictive power against the
-head's target **controlling for the span we already picked** (the same partial-IC tool the echo-netting cell
-uses; control = the chosen span). A cell that stays **lit** is **orthogonal** — it adds new signal — while
-a cell that **collapses to ≈ 0** is a diluted copy of the pick. Because that heat-map is **in-sample**, the
-keep/drop **decision** is the overfitting-resistant **walk-forward joint-vs-solo** IC
-(`wf_ic([chosen, alt]) − wf_ic([chosen])`): keep the second span only when the out-of-sample gain clears the ~0.01
-floor. We run it for **both heads** (price → signed feature vs the σ-return target; rate → |feature| vs the count
-target). On this block both find the second span a diluted copy (OOS gain ≈ 0), so one span per head suffices.
+price_signed_member = {n: {ex: best_member(price_signed_grid[n][ex]) for ex in OTHERS} for n in PRICE_MOVE_COUNTS}
+price_mag_member    = {n: {ex: best_member(price_mag_grid[n][ex]) for ex in OTHERS} for n in PRICE_MOVE_COUNTS}
+price_member = {ex: best_member(price_gate_grid[ex]) for ex in OTHERS}              # unchanged 100 ms selector for the gate cells below
+rate_member  = {ex: best_member(rate_grid[ex])  for ex in OTHERS}                  # one feature per exchange (rate head) — its span is PICKED here by the |feature|→count grid (in-sample, like the price pick), then the rate-SPAN feature is put through its OWN Gate A/B below (the rate-head gate cell), against the COUNT target — its verdict is not inherited from the price gates
 """)
 
 md(r"""
@@ -871,10 +830,13 @@ md(r"""
 **walk-forward** mean (causal, purged); the one exception is the control-standalone **stratified** IC, which is
 in-sample decoupled (its out-of-sample confirmation comes from the multi-block harness in `tools/oss`).
 
-One caveat for **both heads**: the fast/slow span is chosen by the in-sample heat-map *above* over the
-**whole** block, so the walk-forward IC below is **post-selection and provisional** — mildly optimistic,
-since the test folds also informed the span pick. Held-out span selection is deferred to the multi-block
-`tools/oss` harness; here the choice is among a small 4×4 fast/slow grid (15 valid pairs) of near-identical
+One caveat for **both heads**: the fast/slow span is chosen by the in-sample IC grids computed in the
+span-selection setup above (and displayed in §7) over the **whole** block, so the walk-forward IC below is
+**post-selection and provisional** — mildly optimistic, since the test folds also informed the span pick.
+Held-out span selection is deferred to the multi-block
+`tools/oss` harness; here the choice is among a small 4×4 fast/slow grid (15 valid pairs) **[STALE — pending
+re-run: the grid is now 6×6 / 30 valid pairs, and the "selection bias is small" claim must be re-checked against
+the wider/larger spans]** of near-identical
 neighbours, so the selection bias is expected to be small (we don't measure it on this single block).
 
 **Gate A — regime invariance** (the feature *alone*): is the feature's distribution **stable against our regime
@@ -960,6 +922,8 @@ pl.DataFrame(gate_rows)
 """)
 
 md(r"""
+> ⚠️ **STALE — pending re-run.** The fast/slow sweep grid was expanded (4×4 → 6×6, 15 → 30 valid pairs); the span picks and every IC / scale / magnitude figure in this section were computed on the OLD grid, have **not** been re-derived, and this notebook carries no executed outputs. **Treat these numbers as incorrect until the notebook is re-executed on a real block.**
+
 **Conclusion.** `price_dislocation` clears every gate. It adds ≈ **0.086** walk-forward rank-IC over the
 controls — jointly and for bin alone (okx alone adds ≈ 0.048, but jointly bin already captures the shared
 signal so the joint marginal = bin-alone ≈ 0.086; we keep okx anyway because leadership rotates and its
@@ -973,11 +937,12 @@ check, every exchange** (**Gate A**) — not a level in disguise — and a clean
 **okx** leg is the looser of the two (mag-track 0.091, brushing the ~0.1 bar) — consistent with its staler
 feed, worth watching across blocks. And the companion shows the marginal
 gain positive in **all three** regimes — 0.066 / 0.085 / 0.116 for calm / mid / wild — so the signal is
-regime-stable, not a one-regime artefact. Verdict for the **price head**: clears every local gate on this
+regime-stable, not a one-regime artefact. Verdict for the **100 ms price gate**: clears every local gate on this
 block, **every exchange** — a single-block candidate; shipping is gated by §10. (The rate head is gated separately just below — its verdict is read off the rate-head gate
 table, not inherited from these price-head gates.)
-The chosen scales match the story — the price head took a lightly-smoothed fast leg over a moderate slow
-one (fast=10, slow=500) for both venues; the rate head stayed sharp (fast=1, slow=100).
+The gate-span chosen for the 100 ms price target remains a lightly-smoothed fast leg over a moderate slow
+one (fast=10, slow=500) for both venues; the fixed-n IC diagnostics in §7 report their own signed and magnitude spans.
+The rate head stayed sharp (fast=1, slow=100).
 """)
 
 md(r"""
@@ -986,7 +951,7 @@ feature against the σ_ev **price** target. The rate head is fed a **different-s
 `rate_member` pick) and predicts the **count** target, so its verdict is **not** inherited from the price
 gates — it gets the same two-gate battery here.
 
-The rate head's signal lives in the **magnitude**: `|feature| → count` is the §6 diagnostic, and the model
+The rate head's signal lives in the **magnitude**: `|feature| → count` is the rate diagnostic, and the model
 is fed the **signed** feature and recovers `|·|` itself (a nonlinear head can). So **Gate B scores
 `|feature|`** — a *linear* score on the signed feature would read ≈ 0 precisely because the count
 relationship is symmetric, so `|feature|` is the honest proxy for what the nonlinear rate head extracts.
@@ -1002,7 +967,7 @@ code(r"""
 # The price-head gates above ran the price-SPAN feature against the σ_ev price target. The rate head is fed a
 # DIFFERENT-span feature (the rate_member pick) and predicts the COUNT target, so its verdict can't be inherited
 # from the price gates — it gets the SAME two-gate battery here, against the count target.
-#  * The rate head's signal lives in the MAGNITUDE: |feature|->count is the §6 diagnostic, and the model is fed the
+#  * The rate head's signal lives in the MAGNITUDE: |feature|->count is the rate diagnostic, and the model is fed the
 #    SIGNED feature and recovers |.| internally (a nonlinear head can). So Gate B scores |feature| — a LINEAR score
 #    on the signed feature reads ~0 precisely because the count relationship is symmetric; |feature| is the honest
 #    proxy for what the nonlinear rate head extracts.
@@ -1037,6 +1002,8 @@ pl.DataFrame(rate_rows)
 """)
 
 md(r"""
+> ⚠️ **STALE — pending re-run.** The fast/slow sweep grid was expanded (4×4 → 6×6, 15 → 30 valid pairs); the span picks and every IC / scale / magnitude figure in this section were computed on the OLD grid, have **not** been re-derived, and this notebook carries no executed outputs. **Treat these numbers as incorrect until the notebook is re-executed on a real block.**
+
 **Conclusion (rate head).** The rate-span feature clears the same battery against the **count** target,
 every exchange. **Gate B** — the marginal `|feature| → count` over the controls is **+0.028** jointly,
 **+0.024** (bin) and **+0.014** (okx) on their own, all above the ~0.01 floor; and *within* **λ_ev strata**
@@ -1111,7 +1078,7 @@ a purely *contemporaneous* feature can post a positive forward IC from window ov
 forward IC, **net out the echo**: measure the feature's correlation with the **forward** return
 (`[anchor, anchor+100 ms]`) *controlling for the move that already happened* (`[anchor−100 ms, anchor]`). The
 **backward IC** sizes the echo; the **echo-netted** forward IC is what survives once it's partialled out — the
-genuinely forward-looking edge. (It's the same partial-IC tool §6 uses to test a second time-scale — here the
+genuinely forward-looking edge. (It's the same partial-IC tool §7 uses to test a second time-scale — here the
 control is the trailing move instead of the chosen span.)
 """)
 
@@ -1121,9 +1088,9 @@ rep_ex = OTHERS[0]                                       # one exchange to illus
 def _ic(feat, ret):
     v = np.isfinite(feat) & np.isfinite(ret)
     return spearmanr(feat[v], ret[v]).statistic if v.sum() > 100 else float("nan")
-def _mid_at(t):                                          # byb merged mid at-or-before t (causal)
+def _byb_mid_at(t):                                      # byb merged mid at-or-before t (causal) — distinct name so it never shadows §3's _mid_at(ex, t)
     idx = np.searchsorted(byb_rx, t, "right") - 1; return np.where(idx < 0, np.nan, byb_mid[np.clip(idx, 0, len(byb_mid) - 1)])   # nan before byb's first quote
-def _ret(t0, t1): return np.log(_mid_at(t1) / _mid_at(t0))
+def _ret(t0, t1): return np.log(_byb_mid_at(t1) / _byb_mid_at(t0))
 def _partial_ic(f, y, t):                                # partial rank-IC of f with y, CONTROLLING for t
     v = np.isfinite(f) & np.isfinite(y) & np.isfinite(t)
     if v.sum() <= 100: return float("nan")
@@ -1167,51 +1134,114 @@ recording* is *production timing.)*
 """)
 
 md(r"""
-## 7. What the prediction actually looks like
+## 7. IC breakdown across the span family
 
-A single correlation number hides *how* the feature changes the outcome. So group the data by
-the feature and look at the real distributions the two heads care about:
-- **price head:** byb's next return for low / middle / high feature values — it should tilt
-  one way as the feature turns positive and the other as it turns negative;
-- **rate head:** how the number of upcoming moves grows as the feature's *magnitude* grows.
+The gates and echo-netting above answer whether the feature is worth keeping. This section shows
+where the signal lives across the fast/slow EMA family:
+- **price direction:** `feature → signed fixed-count return`, for `n = 1, 3, 6, 9`;
+- **price magnitude:** `|feature| → |fixed-count return|`, for the same `n`;
+- **rate:** `|feature| → 100 ms move count`.
+
+These are span-selection diagnostics, not separate model targets. The model still gets the signed
+feature and mixes the price-head family with the rate-head count distribution to recover the 100 ms
+return distribution.
 """)
 
 code(r"""
-rep_ex = OTHERS[0]                                                              # one exchange shown to illustrate the shape; the model still uses every exchange
-signed = price_dislocation(rep_ex, FAST[price_member[rep_ex][0]], SLOW[price_member[rep_ex][1]])
-absmag = np.abs(price_dislocation(rep_ex, FAST[rate_member[rep_ex][0]], SLOW[rate_member[rep_ex][1]]))  # deliberately the RATE-head scales (rate_member), not the price-head scales — same feature, rate-head's own span pick
-fig, (axA, axB) = plt.subplots(1, 2, figsize=(13, 4.6))
+def show_grids(grids_by_ex, title, cmap="viridis"):
+    fig, axes = plt.subplots(1, len(OTHERS), figsize=(5.6 * len(OTHERS), 4.2), squeeze=False)
+    for col, ex in enumerate(OTHERS):
+        ax = axes[0][col]; grid = grids_by_ex[ex]; im = ax.imshow(grid, cmap=cmap, aspect="auto")
+        ax.set_xticks(range(len(SLOW))); ax.set_xticklabels(SLOW); ax.set_xlabel("slow span")
+        ax.set_yticks(range(len(FAST))); ax.set_yticklabels(FAST); ax.set_ylabel("fast span")
+        ax.set_title(f"{title}  —  {ex}")
+        for i in range(len(FAST)):
+            for j in range(len(SLOW)):
+                if np.isfinite(grid[i, j]): ax.text(j, i, f"{grid[i, j]:.3f}", ha="center", va="center", color="w", fontsize=7)
+        fig.colorbar(im, ax=ax, fraction=0.046)
+    fig.suptitle(f"{title} across the time-scale family (fast span=1 means no smoothing)", y=1.02)
+    fig.tight_layout(); plt.show()
 
-# price head: forward σ-return distribution across signed-dislocation buckets
-lo, hi = np.nanpercentile(signed, [10, 90])
-groups = [("strong −", signed <= lo, "C3"), ("≈ 0", (signed > lo) & (signed < hi), "0.6"),
-          ("strong +", signed >= hi, "C0")]
-bins = np.linspace(-8, 8, 81)
-for lab, m, col in groups:
-    axA.hist(np.clip(target[m & np.isfinite(target)], -8, 8), bins=bins, density=True,
-             histtype="step", color=col, lw=1.7, label=f"{lab}:  mean {np.nanmean(target[m]):+.2f}")
-axA.set_yscale("log"); axA.set_xlabel("forward σ-return"); axA.set_ylabel("density (log)")
-axA.set_title("price head: return distribution tilts with signed dislocation"); axA.legend(fontsize=8)
+for n in PRICE_MOVE_COUNTS:
+    show_grids(price_signed_grid[n], f"price head n={n}: feature -> signed fixed-move return")
+for n in PRICE_MOVE_COUNTS:
+    show_grids(price_mag_grid[n], f"price head n={n}: |feature| -> |fixed-move return|")
+show_grids(rate_grid, "rate head: |feature| -> move count")
 
-# rate head: forward move-count shifts up with |dislocation|
-# raw fwd_count is shown here only for intuition; the rate head's actual target is rate_target = fwd_count / λ_ev (count ÷ λ_ev)
-dec = np.digitize(absmag, np.nanpercentile(absmag, np.arange(10, 100, 10)))
-axB.plot(range(10), [fwd_count[dec == b].mean() for b in range(10)], "o-", color="C3", label="mean count  E[K]")
-axB.plot(range(10), [(fwd_count[dec == b] >= 1).mean() for b in range(10)], "s--", color="C1", label="P(K ≥ 1)")
-axB.set_xlabel("|dislocation| decile (small → large gap)"); axB.set_ylabel("forward 100 ms")
-axB.set_title("rate head: move-count distribution shifts up with |dislocation|"); axB.legend(fontsize=8)
+print("kept features (one per exchange, all fed to the model — none privileged):")
+for ex in OTHERS:
+    pi, pj = price_member[ex]; ri, rj = rate_member[ex]
+    print(f"  {ex}:")
+    for n in PRICE_MOVE_COUNTS:
+        psi, psj = price_signed_member[n][ex]; pmi, pmj = price_mag_member[n][ex]
+        print(f"    price n={n}: signed (fast={FAST[psi]}, slow={SLOW[psj]}) power={price_signed_grid[n][ex][psi, psj]:.3f}"
+              f"  |  magnitude (fast={FAST[pmi]}, slow={SLOW[pmj]}) power={price_mag_grid[n][ex][pmi, pmj]:.3f}")
+    print(f"    gate price span remains 100 ms (fast={FAST[pi]}, slow={SLOW[pj]}) power={price_gate_grid[ex][pi, pj]:.3f}"
+          f"  |  rate head (fast={FAST[ri]}, slow={SLOW[rj]}) power={rate_grid[ex][ri, rj]:.3f}")
+
+# === Does a SECOND time-scale ADD over the pick? — the sweep RE-SCORED conditional on the best member, PER DIAGNOSTIC ===
+# We picked the best span per diagnostic by IC; now re-score the WHOLE family as
+# partial-IC(cell | chosen) -- each cell's IC against the diagnostic target, CONTROLLING for the span we picked.
+def _pic(f, y, c):                                                   # partial rank-IC of f with y, controlling for c
+    m = np.isfinite(f) & np.isfinite(y) & np.isfinite(c)
+    if m.sum() <= 100: return np.nan
+    rfy = spearmanr(f[m], y[m]).statistic; rfc = spearmanr(f[m], c[m]).statistic; rcy = spearmanr(c[m], y[m]).statistic
+    return (rfy - rfc * rcy) / np.sqrt(max((1.0 - rfc**2) * (1.0 - rcy**2), 1e-12))
+
+HEADS = []
+for n in PRICE_MOVE_COUNTS:
+    HEADS.append((f"price head n={n} signed", lambda ex, nf, ns: feat_cache[(ex, nf, ns)],
+                  fixed_move_target[n], price_signed_member[n]))
+for n in PRICE_MOVE_COUNTS:
+    HEADS.append((f"price head n={n} magnitude", lambda ex, nf, ns: np.abs(feat_cache[(ex, nf, ns)]),
+                  np.abs(fixed_move_target[n]), price_mag_member[n]))
+HEADS.append(("rate head", lambda ex, nf, ns: np.abs(feat_cache[(ex, nf, ns)]), rate_target, rate_member))
+
+fig, axes = plt.subplots(len(HEADS), len(OTHERS), figsize=(5.6 * len(OTHERS), 4.2 * len(HEADS)), squeeze=False)
+conditional_jobs = [(row, col, head, feat, tgt, member, ex)
+                    for row, (head, feat, tgt, member) in enumerate(HEADS)
+                    for col, ex in enumerate(OTHERS)]
+def _conditional_member(job):
+    row, col, head, feat, tgt, member, ex = job
+    ci, cj = member[ex]
+    chosen = feat(ex, FAST[ci], SLOW[cj])
+    cond = np.full((len(FAST), len(SLOW)), np.nan)
+    for i, j, nf, ns in valid_members:
+        cond[i, j] = 0.0 if (i, j) == (ci, cj) else _pic(feat(ex, nf, ns), tgt, chosen)
+    bi, bj = np.unravel_index(np.nanargmax(np.abs(cond)), cond.shape)          # the most-orthogonal alternative cell (in-sample screen)
+    f1, f2 = chosen, feat(ex, FAST[bi], SLOW[bj])
+    solo, joint = wf_ic([f1], tgt), wf_ic([f1, f2], tgt)                       # OOS: chosen alone vs the pair
+    keep = bool((joint - solo) >= 0.01)                                        # the OOS joint gain DECIDES
+    return row, col, head, ex, cond, bi, bj, solo, joint, keep
+with ThreadPoolExecutor(max_workers=N_JOBS) as pool:
+    conditional_results = {}
+    for result in pool.map(_conditional_member, conditional_jobs):
+        row, col = result[:2]
+        conditional_results[(row, col)] = result
+for row, (head, feat, tgt, member) in enumerate(HEADS):
+    print(f"does a 2nd span add over the pick? — {head}: conditional partial-IC (in-sample screen) + walk-forward joint-vs-solo OOS:")
+    for col, ex in enumerate(OTHERS):
+        _, _, _, _, cond, bi, bj, solo, joint, keep = conditional_results[(row, col)]
+        ax = axes[row][col]; im = ax.imshow(cond, cmap="magma", aspect="auto")
+        ax.set_xticks(range(len(SLOW))); ax.set_xticklabels(SLOW); ax.set_xlabel("slow span")
+        ax.set_yticks(range(len(FAST))); ax.set_yticklabels(FAST); ax.set_ylabel("fast span")
+        ax.set_title(f"IC | best span — {ex} · {head}")
+        for i in range(len(FAST)):
+            for j in range(len(SLOW)):
+                if np.isfinite(cond[i, j]): ax.text(j, i, f"{cond[i, j]:+.3f}", ha="center", va="center", color="w", fontsize=7)
+        fig.colorbar(im, ax=ax, fraction=0.046)
+        print(f"  {ex}: best alt (f={FAST[bi]},s={SLOW[bj]}) IC|best {cond[bi, bj]:+.3f};  OOS joint {joint:+.3f} vs solo {solo:+.3f} (Δ{joint - solo:+.3f})"
+              f"  ->  {'KEEP 2nd span (adds OOS)' if keep else 'one span suffices (no OOS gain)'}")
+fig.suptitle("the family RE-SCORED conditional on the best pick, per diagnostic (lit = orthogonal / adds; ~0 = diluted copy of the pick)", y=1.005)
 fig.tight_layout(); plt.show()
 """)
 
 md(r"""
-**Conclusion.** The feature moves the *actual outcome distributions* the way the two heads
-need — not just a single summary number. **Price head (left):** the forward-return distribution
-shifts bodily with the *signed* feature — a negative mean return for the strong-negative group,
-positive for the strong-positive group, with the flat ≈0 group between — so the sign genuinely
-carries direction. **Rate head (right):** both the mean move-count `E[K]` and `P(K ≥ 1)` climb
-monotonically from the smallest to the largest |dislocation| decile — a big gap really does
-precede more catch-up moves. So both heads have something to learn here, in the directions §1
-predicted.
+**How to read this section.** The first block compares the primary ICs in the requested order:
+all fixed-count price-direction ICs, then all fixed-count price-magnitude ICs, then the rate IC.
+The conditional heat-map asks a different question: whether a second span adds signal after the
+best span for that diagnostic is already present. Negative conditional values are not failed
+primary ICs; they usually mean the alternate span is a diluted or opposing copy of the selected span.
 """)
 
 md(r"""
@@ -1260,6 +1290,8 @@ fig.tight_layout(); plt.show()
 """)
 
 md(r"""
+> ⚠️ **STALE — pending re-run.** The fast/slow sweep grid was expanded (4×4 → 6×6, 15 → 30 valid pairs); the span picks and every IC / scale / magnitude figure in this section were computed on the OLD grid, have **not** been re-derived, and this notebook carries no executed outputs. **Treat these numbers as incorrect until the notebook is re-executed on a real block.**
+
 **Conclusion.** For this feature the printout settles it: it's already near-symmetric (skew ≈ 0)
 with only mild fat tails — *because* it's divided by `σ_ev` — so a plain rescale (z-score) keeps
 the excess kurtosis low. But it still leaves a ≈28σ spike (max|·| = 27.8), which violates the
@@ -1285,7 +1317,7 @@ imbalance) *can* be pooled into one number, and then you face a real choice: kee
 the time-scale, so sweep it and compare the three.
 
 > **The table below is an illustrative example for a poolable trade-flow feature — it is NOT
-> computed for `price_dislocation`** (whose real per-exchange numbers are the heat-maps in §6).
+> computed for `price_dislocation`** (whose real per-exchange numbers are the heat-maps in §7).
 > It just shows the typical pattern, predicting byb's next 100 ms. The time-scale
 > column is labelled in ms / seconds only for readability — those wall-clock figures are
 > just a translation of points on the trade-span N clock; the actual sweep is over trade-span
@@ -1308,11 +1340,12 @@ sweep the horizon too.)
 md(r"""
 ## 10. The verdict, and what it takes to ship
 
+> ⚠️ **STALE — pending re-run.** The fast/slow sweep grid was expanded (4×4 → 6×6, 15 → 30 valid pairs); the span picks and every IC / scale / magnitude figure in this section were computed on the OLD grid, have **not** been re-derived, and this notebook carries no executed outputs. **Treat these numbers as incorrect until the notebook is re-executed on a real block.**
+
 **Keep it — feed the *signed* feature to both heads (each head gated separately in §6), all exchanges, at
 a couple of time-scales each:**
-- **Price head (direction):** a fast average over a slow one — here both venues landed on a
-  lightly-smoothed fast leg over a moderate slow one (fast=10, slow=500); how much to smooth is a
-  per-feature choice, so sweep it.
+- **Price head (direction and magnitude):** use the fixed-n IC diagnostics (`PRICE_MOVE_COUNTS`) to inspect
+  signed fixed-count return and fixed-count move magnitude. The 100 ms gate span remains recorded separately.
 - **Rate head (intensity):** a sharp pair — an unsmoothed fast leg (n_fast=1) minus a short
   slow leg (n_slow=100), so the difference reacts to the freshest gap.
   The *magnitude* of the gap is what predicts a burst of moves, but you still feed the
@@ -1346,5 +1379,5 @@ nb = {
     "nbformat": 4, "nbformat_minor": 5,
 }
 out = Path(__file__).resolve().parents[1] / "template.ipynb"   # notebooks/features/template.ipynb, relative to this builder (portable across checkouts)
-out.write_text(json.dumps(nb, indent=1))
+out.write_text(json.dumps(nb, indent=1) + "\n")
 print("wrote", out, "with", len(cells), "cells")

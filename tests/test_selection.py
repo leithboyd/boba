@@ -1,0 +1,334 @@
+"""Tests for the span & head SELECTION engines (boba.research.selection).
+
+The generic machinery (the count-conditioned price target, the in-sample IC grid, the conditional
+second-span partial-IC + walk-forward join, and the per-exchange-vs-single comparison) is
+exercised on SYNTHETIC families with a target of KNOWN structure, so the picks are predictable and
+the tests run with no DATA_DIR. A real-block integration test (skipped without DATA_DIR) builds the
+price_dislocation family over the standard sweep grid and asserts the documented in-sample span picks
+(price head (10, 500); rate-head abs-feature (1, 100)) reproduce the screening refactor's ground truth.
+"""
+import numpy as np
+import pytest
+
+import boba.io as io
+from boba.research.screening import RawEventStream, ScreeningContext, _ffill
+from boba.research.selection import (
+    fixed_move_targets,
+    ic_grid,
+    per_exchange_vs_single,
+    second_span_adds,
+)
+
+
+# --------------------------------------------------------------------------------------------------
+# helpers — synthetic contexts / families
+# --------------------------------------------------------------------------------------------------
+def _empty_ctx(**over) -> ScreeningContext:
+    """A minimal ScreeningContext with everything empty — fields are overridden per test."""
+    kw = dict(
+        block="syn", coin="x", target="byb_x", sources=("aaa", "bbb"), horizon_ns=0,
+        yardstick_span=10, mid_stream={}, merged_ts=np.empty(0), anchor_ts=np.empty(0),
+        tick_at_anchor=np.empty(0), sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0),
+        price_target=np.empty(0), rate_target=np.empty(0), base=[], vol_level=np.empty(0),
+        rate_level=np.empty(0), vol_regime=np.empty(0),
+        raw_events=RawEventStream(*([np.empty(0)] * 6), ()),
+    )
+    kw.update(over)
+    return ScreeningContext(**kw)
+
+
+def _grid_family(spans_fast, spans_slow, leg_of):
+    """Build `{(nf, ns) -> {source -> vec}}` for every valid (nf<ns) pair via `leg_of(src, nf, ns)`."""
+    sources = ("aaa", "bbb")
+    fam = {}
+    for nf in spans_fast:
+        for ns in spans_slow:
+            if nf >= ns:
+                continue
+            fam[(nf, ns)] = {s: leg_of(s, nf, ns) for s in sources}
+    return fam
+
+
+# --------------------------------------------------------------------------------------------------
+# fixed_move_targets — count-conditioned signed return / σ_ev, against a dead-simple loop oracle
+# --------------------------------------------------------------------------------------------------
+def _fixed_move_oracle(rx, mid, move_rx, anchor_ts, sigma, counts):
+    """Independent oracle: for each anchor and count n, walk forward to the n-th target MOVE strictly
+    after the anchor and take log(mid_at_that_move) - log(mid_now), / sigma. Explicit, no shared code."""
+    out = {}
+    move_lm = np.array([np.log(mid[np.searchsorted(rx, mrx, "right") - 1]) for mrx in move_rx])
+    for n in counts:
+        col = np.full(len(anchor_ts), np.nan)
+        for a in range(len(anchor_ts)):
+            inow = np.searchsorted(rx, anchor_ts[a], "right") - 1
+            if inow < 0:
+                continue
+            log_now = np.log(mid[inow])
+            # index into move_rx: first move strictly after anchor is searchsorted(...,"right"); n-th is +n-1
+            k = np.searchsorted(move_rx, anchor_ts[a], "right") + n - 1
+            if k < len(move_lm):
+                col[a] = (move_lm[k] - log_now) / sigma[a]
+        out[n] = col
+    return out
+
+
+def test_fixed_move_targets_matches_oracle():
+    rng = np.random.default_rng(0)
+    n_ticks = 4000
+    rx = (np.arange(1, n_ticks + 1) * 10).astype(np.int64)
+    # a target mid that moves on ~60% of timestamps (the rest repeat the previous mid -> not a "move")
+    moves = rng.random(n_ticks) < 0.6
+    moves[0] = True
+    steps = np.where(moves, rng.standard_normal(n_ticks) * 1e-4, 0.0)
+    mid = 100.0 * np.exp(np.cumsum(steps))
+    # the move stream the context exposes: dedup-collapsed timestamps where the mid changed
+    move_rx = rx[moves]
+    anchor_ts = np.arange(int(rx[50]), int(rx[-50]), 70, dtype=np.int64)
+    sigma = np.full(len(anchor_ts), 2e-4)
+    ctx = _empty_ctx(target="byb_x", anchor_ts=anchor_ts, sigma_at_anchor=sigma,
+                     _mids={"byb": (rx, mid)}, _mv_rx=move_rx)
+    counts = (1, 3, 6, 9)
+    got = fixed_move_targets(ctx, counts=counts)
+    ref = _fixed_move_oracle(rx, mid, move_rx, anchor_ts, sigma, counts)
+    assert set(got) == set(counts)
+    for n in counts:
+        ok = np.isfinite(ref[n])
+        assert ok.sum() > 100
+        np.testing.assert_allclose(got[n][ok], ref[n][ok], rtol=1e-10, atol=1e-12)
+        # n=1 must be the nearest move (smallest |return|, on average), n=9 the farthest
+    # monotone: a farther move accumulates a larger typical |return|
+    mags = [np.nanmean(np.abs(got[n])) for n in counts]
+    assert mags[0] < mags[-1]
+
+
+def test_fixed_move_targets_default_counts():
+    rng = np.random.default_rng(1)
+    rx = (np.arange(1, 2001) * 10).astype(np.int64)
+    moves = rng.random(2000) < 0.7
+    moves[0] = True
+    mid = 100.0 * np.exp(np.cumsum(np.where(moves, rng.standard_normal(2000) * 1e-4, 0.0)))
+    anchor_ts = np.arange(int(rx[40]), int(rx[-40]), 50, dtype=np.int64)
+    ctx = _empty_ctx(anchor_ts=anchor_ts, sigma_at_anchor=np.full(len(anchor_ts), 1e-4),
+                     _mids={"byb": (rx, mid)}, _mv_rx=rx[moves])
+    got = fixed_move_targets(ctx)
+    assert set(got) == {1, 3, 6, 9}                      # default counts
+
+
+# --------------------------------------------------------------------------------------------------
+# ic_grid — nf>=ns cells are nan; the planted (fast, slow) cell is the in-sample best
+# --------------------------------------------------------------------------------------------------
+def test_ic_grid_axes_and_nan_triangle():
+    rng = np.random.default_rng(2)
+    n = 6000
+    target = rng.standard_normal(n)
+    fasts, slows = (1, 10, 50), (10, 50, 100)
+    fam = _grid_family(fasts, slows, lambda s, nf, ns: rng.standard_normal(n))
+    grids = ic_grid(_empty_ctx(), fam, target)
+    assert set(grids) == {"aaa", "bbb"}
+    for g in grids.values():
+        assert g.shape == (len(fasts), len(slows))
+        # nf>=ns has no family member -> stays nan
+        assert np.isnan(g[1, 0])                          # (10, 10): nf==ns
+        assert np.isnan(g[2, 0]) and np.isnan(g[2, 1])    # (50,10),(50,50): nf>=ns
+        assert np.isfinite(g[0, 0])                        # (1, 10): valid pair scored
+
+
+def test_ic_grid_picks_planted_cell():
+    rng = np.random.default_rng(3)
+    n = 8000
+    target = rng.standard_normal(n)
+    fasts, slows = (1, 10, 50), (10, 50, 100)
+    best = (10, 50)                                        # the cell we plant the signal into
+
+    def leg_of(src, nf, ns):
+        if (nf, ns) == best:
+            return target * 0.6 + rng.standard_normal(n)   # strong in-sample IC
+        return rng.standard_normal(n) + target * 0.05      # weak everywhere else
+
+    fam = _grid_family(fasts, slows, leg_of)
+    grids = ic_grid(_empty_ctx(), fam, target)
+    fi, sj = fasts.index(best[0]), slows.index(best[1])
+    for src, g in grids.items():
+        i, j = np.unravel_index(np.nanargmax(g), g.shape)
+        assert (i, j) == (fi, sj), f"{src}: in-sample best {(i, j)} != planted {(fi, sj)}"
+
+
+def test_ic_grid_magnitude_scores_abs():
+    rng = np.random.default_rng(4)
+    n = 8000
+    base = rng.standard_normal(n)
+    target = np.abs(base) + 0.3 * rng.standard_normal(n)   # depends on |signal|, symmetric in sign
+    fasts, slows = (1, 10), (10, 100)
+    best = (10, 100)
+
+    def leg_of(src, nf, ns):
+        # sign-randomised so the SIGNED IC ~ 0 but |feature| tracks the target's magnitude structure
+        sgn = rng.choice([-1.0, 1.0], n)
+        if (nf, ns) == best:
+            return sgn * (np.abs(base) + 0.2 * rng.standard_normal(n))
+        return sgn * rng.standard_normal(n)
+
+    fam = _grid_family(fasts, slows, leg_of)
+    signed = ic_grid(_empty_ctx(), fam, target, magnitude=False)
+    mag = ic_grid(_empty_ctx(), fam, target, magnitude=True)
+    fi, sj = fasts.index(best[0]), slows.index(best[1])
+    for src in ("aaa", "bbb"):
+        assert abs(signed[src][fi, sj]) < 0.1             # signed carries ~no signal
+        assert mag[src][fi, sj] > 0.3                      # |feature| does
+        i, j = np.unravel_index(np.nanargmax(mag[src]), mag[src].shape)
+        assert (i, j) == (fi, sj)
+
+
+# --------------------------------------------------------------------------------------------------
+# second_span_adds — an orthogonal alt that adds OOS is KEPT; a redundant copy is not
+# --------------------------------------------------------------------------------------------------
+def test_second_span_adds_keeps_orthogonal():
+    rng = np.random.default_rng(5)
+    n = 24000
+    # target = two independent components; the chosen span carries A, an orthogonal span carries B.
+    comp_a = rng.standard_normal(n)
+    comp_b = rng.standard_normal(n)
+    target = comp_a + comp_b + 0.3 * rng.standard_normal(n)
+    fasts, slows = (1, 10, 50), (10, 50, 100)
+    chosen = (1, 10)
+    orth = (50, 100)
+
+    def leg_of(src, nf, ns):
+        if (nf, ns) == chosen:
+            return comp_a + 0.2 * rng.standard_normal(n)
+        if (nf, ns) == orth:
+            return comp_b + 0.2 * rng.standard_normal(n)   # the OTHER component -> adds OOS
+        return comp_a + 0.5 * rng.standard_normal(n)        # diluted copies of the chosen span
+
+    fam = _grid_family(fasts, slows, leg_of)
+    res = second_span_adds(_empty_ctx(), fam, chosen, target)
+    assert set(res) == {"aaa", "bbb"}
+    for src, r in res.items():
+        assert r["best_alt"] == orth                       # the orthogonal span is the most-orthogonal cell
+        assert r["oos_joint"] - r["oos_solo"] >= 0.01
+        assert r["keep"] is True
+
+
+def test_second_span_adds_rejects_redundant():
+    rng = np.random.default_rng(6)
+    n = 24000
+    comp_a = rng.standard_normal(n)
+    target = comp_a + 0.05 * rng.standard_normal(n)       # target is comp_a almost exactly
+    fasts, slows = (1, 10, 50), (10, 50, 100)
+    chosen = (1, 10)
+
+    def leg_of(src, nf, ns):
+        # the chosen span is a near-perfect read of comp_a; every OTHER span is a much NOISIER copy of
+        # the SAME single component -> no second span carries anything the (already near-ceiling) pick lacks
+        noise = 0.05 if (nf, ns) == chosen else 1.5
+        return comp_a + noise * rng.standard_normal(n)
+
+    fam = _grid_family(fasts, slows, leg_of)
+    res = second_span_adds(_empty_ctx(), fam, chosen, target)
+    for src, r in res.items():
+        assert r["oos_joint"] - r["oos_solo"] < 0.01
+        assert r["keep"] is False
+
+
+def test_second_span_adds_chosen_cell_is_zero_in_screen():
+    # the chosen cell's conditional partial-IC is forced to 0 -> it can never be its own "best alt"
+    rng = np.random.default_rng(7)
+    n = 12000
+    target = rng.standard_normal(n)
+    fasts, slows = (1, 10), (10, 100)
+    chosen = (1, 10)
+    fam = _grid_family(fasts, slows, lambda s, nf, ns: target * 0.4 + rng.standard_normal(n))
+    res = second_span_adds(_empty_ctx(), fam, chosen, target)
+    for r in res.values():
+        assert r["best_alt"] != chosen
+
+
+# --------------------------------------------------------------------------------------------------
+# per_exchange_vs_single — keep every source's leg vs the single best source (no pooling / merging)
+# --------------------------------------------------------------------------------------------------
+def test_per_exchange_vs_single_keeps_all():
+    rng = np.random.default_rng(8)
+    n = 24000
+    # the two sources enter the target with OPPOSITE sign -> the legs carry genuinely distinct structure
+    # a learned joint weighting (per-exchange) captures but neither single leg alone can recover.
+    sa = rng.standard_normal(n)
+    sb = rng.standard_normal(n)
+    target = sa - sb + 0.3 * rng.standard_normal(n)
+    params = (10, 100)
+    fam = {params: {"aaa": sa + 0.2 * rng.standard_normal(n),
+                    "bbb": sb + 0.2 * rng.standard_normal(n)}}
+    res = per_exchange_vs_single(_empty_ctx(), fam, params, target)
+    assert set(res) == {"per_exchange", "best_single", "adds_over_single"}
+    assert set(res["best_single"]) == {"ic", "source"}
+    assert res["per_exchange"] > res["best_single"]["ic"] + 0.05   # keeping both clearly beats one
+    assert res["adds_over_single"] is True
+
+
+def test_per_exchange_vs_single_one_suffices():
+    rng = np.random.default_rng(9)
+    n = 24000
+    signal = rng.standard_normal(n)
+    target = signal + 0.3 * rng.standard_normal(n)
+    params = (10, 100)
+    fam = {params: {"aaa": signal + 0.2 * rng.standard_normal(n),   # carries the signal
+                    "bbb": rng.standard_normal(n)}}                  # pure noise — adds nothing
+    res = per_exchange_vs_single(_empty_ctx(), fam, params, target)
+    assert res["best_single"]["source"] == "aaa"
+    assert res["adds_over_single"] is False                          # the noise leg adds nothing over one good leg
+
+
+# --------------------------------------------------------------------------------------------------
+# real-block integration (skipped without DATA_DIR) — the documented span picks reproduce
+# --------------------------------------------------------------------------------------------------
+GRID = [(nf, ns) for nf in (1, 10, 50, 200, 500, 1000)
+        for ns in (100, 500, 1000, 2000, 5000, 10000) if nf < ns]
+
+
+@pytest.mark.skipif(getattr(io, "DATA_DIR", None) is None, reason="no DATA_DIR configured")
+def test_real_block_span_picks():
+    from boba.features import price_dislocation as pd  # noqa: F401  (registers the feature)
+    from boba.features import base
+    from boba.research.screening import build_context, build_family
+
+    ctx = build_context()
+    spec = base.get("price_dislocation")
+    family = build_family(ctx, spec.vectorized, GRID, n_jobs=8)
+
+    # --- price head: signed feature -> 100 ms σ_ev return; in-sample best span is (10, 500) ---
+    price_grids = ic_grid(ctx, family, ctx.price_target)
+    mean_price = sum(price_grids.values()) / len(price_grids)   # mean over sources (nan-aligned: same valid cells)
+    fasts = sorted({p[0] for p in family}); slows = sorted({p[1] for p in family})
+    i, j = np.unravel_index(np.nanargmax(mean_price), mean_price.shape)
+    assert (fasts[i], slows[j]) == (10, 500), f"price-head best span {(fasts[i], slows[j])} != (10, 500)"
+
+    # --- rate head: |feature| -> count target; in-sample best abs-feature span is (1, 100) ---
+    rate_grids = ic_grid(ctx, family, ctx.rate_target, magnitude=True)
+    mean_rate = sum(rate_grids.values()) / len(rate_grids)
+    ri, rj = np.unravel_index(np.nanargmax(mean_rate), mean_rate.shape)
+    assert (fasts[ri], slows[rj]) == (1, 100), f"rate-head abs best span {(fasts[ri], slows[rj])} != (1, 100)"
+
+
+@pytest.mark.skipif(getattr(io, "DATA_DIR", None) is None, reason="no DATA_DIR configured")
+def test_real_block_fixed_move_and_second_span():
+    from boba.features import price_dislocation as pd  # noqa: F401
+    from boba.features import base
+    from boba.research.screening import build_context, build_family
+
+    ctx = build_context()
+    spec = base.get("price_dislocation")
+
+    # fixed-move targets are finite and ordered (a farther move -> a larger typical |return|)
+    fmt = fixed_move_targets(ctx)
+    assert set(fmt) == {1, 3, 6, 9}
+    for n, col in fmt.items():
+        assert np.isfinite(col).sum() > 1000
+    assert np.nanmean(np.abs(fmt[1])) < np.nanmean(np.abs(fmt[9]))
+
+    # second_span_adds runs end-to-end on the real family at the documented price pick
+    family = build_family(ctx, spec.vectorized, GRID, n_jobs=8)
+    res = second_span_adds(ctx, family, (10, 500), ctx.price_target)
+    assert set(res) == set(ctx.sources)
+    for r in res.values():
+        assert r["best_alt"] in GRID
+        assert isinstance(r["keep"], bool)
+        assert np.isfinite(r["oos_solo"]) and np.isfinite(r["oos_joint"])
