@@ -8,6 +8,9 @@ Two implementations of the same maths, tied by `boba.research.screening.parity_c
   - `vectorized(ctx, params)` -> {source -> feature vector on the grid}   (offline, may use lfilter)
   - `LiveDislocation`         -> the O(1) streaming build (composes `LiveYardstick` for σ_ev)
 
+Mirror augmentation: the feature is ODD under the reflection of the tape through byb's mid, so `SPEC.mirror`
+is `np.negative` (see the SPEC comment below and `AUTHORING.md` → Mirror augmentation).
+
 See `AUTHORING.md` (this directory) for the EMA-type and inject/decay rules these obey.
 """
 from __future__ import annotations
@@ -117,5 +120,10 @@ SPEC = FeatureSpec(
     vectorized=vectorized,
     make_streaming=lambda ctx, params: LiveDislocation(ctx, params),
     keys_for=lambda ctx, params: tuple(ctx.sources),
+    # Mirror augmentation: reflecting the tape through byb's mid negates this feature. The legs are linear
+    # in the log gap and the gap is a price-DIFFERENCE (the reflection level cancels), so gap -> -gap and
+    # each leg -> -leg; σ_ev is built from squared byb moves (even), so it is unchanged. Hence the feature
+    # is ODD -> np.negative. (The signed target negates too; the engines handle that.) See AUTHORING.md.
+    mirror=np.negative,
 )
 register(SPEC)

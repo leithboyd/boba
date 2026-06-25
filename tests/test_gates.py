@@ -761,3 +761,48 @@ def test_marginal_ci_deterministic(signal_data):
     a = g.marginal_ci([d["feat"]], d["base"], d["tgt"], B=150, seed=7)
     b = g.marginal_ci([d["feat"]], d["base"], d["tgt"], B=150, seed=7)
     assert a == b
+
+
+# ==================================================================================================
+# Mirror augmentation (reflection of the tape through byb's mid; AUTHORING.md → Mirror augmentation)
+# ==================================================================================================
+def test_wf_ic_mirror_matches_manual_interleave():
+    # wf_ic(mirror=fn) must equal running the plain walk-forward on the dataset where each anchor is
+    # interleaved with its reflection (feature cols via fn, target negated) and the embargo doubled.
+    rng = np.random.default_rng(7)
+    n = 12_000
+    f1, f2 = rng.standard_normal(n), rng.standard_normal(n)
+    y = 0.4 * f1 - 0.3 * f2 + 0.5 * rng.standard_normal(n)
+    auto = g.wf_ic([f1, f2], y, embargo=500, mirror=np.negative)
+
+    def il(a, b):
+        out = np.empty(2 * len(a)); out[0::2] = a; out[1::2] = b; return out
+    manual = g.wf_ic([il(f1, -f1), il(f2, -f2)], il(y, -y), embargo=1000, mirror=None)
+    assert auto == pytest.approx(manual, abs=1e-12)
+
+
+def test_mirror_ic_preserves_odd_kills_even():
+    # The mirror-augmented Spearman measures only the ODD (direction-consistent) association:
+    #   a purely odd relationship is preserved; a purely even one cannot manufacture signed signal.
+    rng = np.random.default_rng(11)
+    m = 60_000
+    f = rng.standard_normal(m)
+    cat = lambda a: np.concatenate([a, -a])
+    y_odd = 0.5 * f + 0.3 * rng.standard_normal(m)
+    y_even = 0.8 * np.abs(f) + 0.3 * rng.standard_normal(m)
+    assert g.ic(cat(f), cat(y_odd)) == pytest.approx(g.ic(f, y_odd), abs=0.01)   # odd preserved
+    assert abs(g.ic(cat(f), cat(y_even))) < 0.02                                  # even -> ~0 (no signed signal)
+
+
+def test_mirror_forces_oos_fit_through_origin():
+    # The symmetric pair drives the OLS intercept to ~0. Probe via wf_folds with a strong target drift:
+    # the mirrored fit must not lean on a constant, so its prediction is odd in the feature sign.
+    rng = np.random.default_rng(3)
+    n = 12_000
+    f = rng.standard_normal(n)
+    y = 0.5 * f + 0.4 + 0.3 * rng.standard_normal(n)        # +0.4 directional drift
+    preds = [pred for _, pred in g.wf_folds([f], y, embargo=500, mirror=np.negative)]
+    assert preds, "no folds produced"
+    # mirrored design has each row paired with its negation -> predictions are antisymmetric across the pair
+    p = preds[0]
+    assert np.allclose(p[0::2], -p[1::2], atol=1e-9)        # pred(reflection) == -pred(anchor)

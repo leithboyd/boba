@@ -26,6 +26,7 @@ conditional, the chosen params token), so the same code selects spans for any fe
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -38,7 +39,7 @@ from boba.research.screening import ScreeningContext, _ffill
 # --------------------------------------------------------------------------------------------------
 def fixed_move_targets(
     ctx: ScreeningContext,
-    counts: tuple[int, ...] = (1, 3, 6, 9),
+    counts: tuple[int, ...] = (1, 5, 10, 15, 20, 25, 30),
 ) -> dict[int, np.ndarray]:
     """The price-head targets conditioned on a FIXED number of future target moves, per count `n`.
 
@@ -88,6 +89,8 @@ def ic_grid(
     target: np.ndarray,
     *,
     magnitude: bool = False,
+    n_jobs: int = 1,
+    mirror=None,
 ) -> dict[str, np.ndarray]:
     """In-sample masked rank-IC of every family member vs `target`, as a `[fast, slow]` grid per source.
 
@@ -97,6 +100,16 @@ def ic_grid(
     cells with `n_fast >= n_slow` (no valid pair) are left `nan`. The IC is the tested masked Spearman
     (drops non-finite rows) — the same diagnostic the monolith §7 grids show. The grid's `nanargmax` is
     the in-sample span pick (used ONLY to pick a time-scale, never as an OOS claim).
+
+    `n_jobs > 1` scores the `(member, source)` cells across a `ThreadPoolExecutor` (the same pattern as
+    `screening.build_family`); `gates.ic` releases the GIL on its sort/rank numpy work, so threads give a
+    real speed-up. The result is independent of `n_jobs` — each cell writes its own `[i, j]` and
+    `gates.ic` is deterministic — so the parallel grid is bit-identical to the sequential one.
+
+    `mirror` (a feature's reflection callable, e.g. `FeatureSpec.mirror` / `np.negative`) mirror-augments
+    each SIGNED cell — `ic(concat[vec, mirror(vec)], concat[target, -target])`, the reflection of the tape
+    through byb's mid (feature reflected by `mirror`, the signed target negated) — so the IC is
+    direction-free. Ignored when `magnitude` (|·| is sign-blind). See AUTHORING.md → Mirror augmentation.
     """
     from boba.research import gates as g
 
@@ -105,13 +118,32 @@ def ic_grid(
     grids = {s: np.full((len(fasts), len(slows)), np.nan) for s in sources}
     fi = {f: i for i, f in enumerate(fasts)}
     sj = {s: j for j, s in enumerate(slows)}
+
+    use_mirror = mirror is not None and not magnitude
+    aug_target = np.concatenate([target, -target]) if use_mirror else target
+
+    jobs = []                                            # one (cell, source) scoring task each
     for (nf, ns), legs in family.items():
         if nf >= ns:                                     # no valid fast<slow pair -> leave nan
             continue
         i, j = fi[nf], sj[ns]
         for src, vec in legs.items():
-            score = np.abs(vec) if magnitude else vec
-            grids[src][i, j] = g.ic(score, target)
+            jobs.append((i, j, src, vec))
+
+    def _score(job):
+        i, j, src, vec = job
+        score = np.abs(vec) if magnitude else vec
+        if use_mirror:
+            score = np.concatenate([score, mirror(score)])
+        return i, j, src, g.ic(score, aug_target)
+
+    if n_jobs > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            results = list(pool.map(_score, jobs))
+    else:
+        results = [_score(job) for job in jobs]
+    for i, j, src, val in results:
+        grids[src][i, j] = val
     return grids
 
 
@@ -119,11 +151,16 @@ def ic_grid(
 # §7 — partial-IC (controls for the chosen span). Composed from gates.ic on a COMMON mask, exactly
 # like screening._partial_ic — the one allowed hand-composition (a partial of the tested masked IC).
 # --------------------------------------------------------------------------------------------------
-def _partial_ic(f: np.ndarray, y: np.ndarray, c: np.ndarray) -> float:
+def _partial_ic(f: np.ndarray, y: np.ndarray, c: np.ndarray, mirror=None) -> float:
     """Partial rank-IC of `f` with `y` controlling for `c` — `gates.ic` on the common-finite subset,
-    combined with the standard partial-correlation formula (identical to `screening._partial_ic`)."""
+    combined with the standard partial-correlation formula (identical to `screening._partial_ic`).
+
+    `mirror` (a feature reflection callable) mirror-augments first: both feature legs `f`, `c` are
+    reflected via `mirror` and the signed target `y` is negated (AUTHORING.md → Mirror augmentation)."""
     from boba.research import gates as g
 
+    if mirror is not None:
+        f = np.concatenate([f, mirror(f)]); c = np.concatenate([c, mirror(c)]); y = np.concatenate([y, -y])
     v = np.isfinite(f) & np.isfinite(y) & np.isfinite(c)
     if v.sum() <= 100:
         return float("nan")
@@ -138,6 +175,7 @@ def second_span_adds(
     target: np.ndarray,
     *,
     magnitude: bool = False,
+    mirror=None,
 ) -> dict[str, dict]:
     """Does a SECOND span add over the in-sample pick `chosen_params`, per source? (monolith §7.)
 
@@ -150,7 +188,9 @@ def second_span_adds(
          OOS via `gates.wf_ic`; `keep = (joint - solo) >= 0.01` — the OOS joint gain decides, not the
          in-sample partial.
 
-    `magnitude` scores `|member|` / `|target|` (the rate-head / magnitude diagnostics). Per source returns
+    `magnitude` scores `|member|` / `|target|` (the rate-head / magnitude diagnostics). `mirror` (a feature
+    reflection callable) mirror-augments the SIGNED branch — automatically disabled when `magnitude`, since
+    |·| is sign-blind (AUTHORING.md → Mirror augmentation). Per source returns
     `dict(best_alt, cond_ic, oos_solo, oos_joint, keep)` — `best_alt` the chosen alternative params token,
     `cond_ic` its in-sample partial-IC given the pick, `oos_solo`/`oos_joint` the walk-forward ICs.
     """
@@ -160,6 +200,7 @@ def second_span_adds(
     sources = sorted({s for legs in family.values() for s in legs})
     ci, cj = chosen_params
     tgt = np.abs(target) if magnitude else target
+    mir = None if magnitude else mirror                  # |·| is sign-blind -> never mirror the rate head
 
     def member(src: str, params: Params) -> np.ndarray:
         vec = family[params][src]
@@ -175,12 +216,12 @@ def second_span_adds(
                 continue
             i, j = fasts.index(nf), slows.index(ns)
             cell_params[(i, j)] = (nf, ns)
-            cond[i, j] = 0.0 if (nf, ns) == (ci, cj) else _partial_ic(member(src, (nf, ns)), tgt, chosen)
+            cond[i, j] = 0.0 if (nf, ns) == (ci, cj) else _partial_ic(member(src, (nf, ns)), tgt, chosen, mirror=mir)
         bi, bj = np.unravel_index(np.nanargmax(np.abs(cond)), cond.shape)   # the most-orthogonal alternative
         best_alt = cell_params[(bi, bj)]
         alt = member(src, best_alt)
-        solo = g.wf_ic([chosen], tgt)
-        joint = g.wf_ic([chosen, alt], tgt)
+        solo = g.wf_ic([chosen], tgt, mirror=mir)
+        joint = g.wf_ic([chosen, alt], tgt, mirror=mir)
         out[src] = dict(
             best_alt=best_alt,
             cond_ic=float(cond[bi, bj]),
@@ -200,6 +241,8 @@ def per_exchange_vs_single(
     family: dict[Params, dict[str, np.ndarray]],
     params: Params,
     target: np.ndarray,
+    *,
+    mirror=None,
 ) -> dict:
     """Does keeping EVERY source's leg (per-exchange) add over the single best source, out-of-sample?
 
@@ -212,7 +255,8 @@ def per_exchange_vs_single(
                       which source won.
     Returns `dict(per_exchange, best_single=dict(ic, source), adds_over_single)`, where `adds_over_single`
     is whether per-exchange beats the best single leg by a meaningful margin (>= 0.01) — the "the sources
-    genuinely differ, keep them all" signal. Runs on any fanned-out family.
+    genuinely differ, keep them all" signal. `mirror` (a feature reflection callable) mirror-augments the
+    OOS scoring against this signed target (AUTHORING.md → Mirror augmentation). Runs on any fanned-out family.
     """
     from boba.research import gates as g
 
@@ -220,8 +264,8 @@ def per_exchange_vs_single(
     keys = sorted(legs)
     leg_list = [legs[k] for k in keys]
 
-    per_exchange = g.wf_ic(leg_list, target)
-    singles = {k: g.wf_ic([legs[k]], target) for k in keys}
+    per_exchange = g.wf_ic(leg_list, target, mirror=mirror)
+    singles = {k: g.wf_ic([legs[k]], target, mirror=mirror) for k in keys}
     best_key = max(keys, key=lambda k: (singles[k] if np.isfinite(singles[k]) else -np.inf))
     best_single = dict(ic=singles[best_key], source=best_key)
     adds = bool(np.isfinite(per_exchange) and np.isfinite(best_single["ic"])

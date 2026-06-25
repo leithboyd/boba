@@ -101,12 +101,21 @@ class FeatureSpec:
     make_streaming -- factory returning a fresh `StreamingFeature` for `(ctx, params)`.
     keys_for       -- the leg keys for a given `(ctx, params)`; lets the engines validate that the
                       vectorized and streaming keys agree before driving (cheap fail-fast).
+    mirror         -- how a built feature-leg vector reflects under the *mirror augmentation* (the
+                      reflection of the tape through byb's mid; see AUTHORING.md → Mirror augmentation).
+                      A callable `vec -> reflected vec`: `np.negative` for a feature ODD in byb's mid (a
+                      signed gap / imbalance — the common case), or a function returning the vector
+                      unchanged for an EVEN feature. The selection/screening engines reflect each feature
+                      leg through this and negate the signed target to score a direction-free IC. `None`
+                      (the default) means the feature has not declared its reflection and may NOT be
+                      mirror-augmented — the engines simply skip it.
     """
 
     name: str
     vectorized: VectorizedBuilder
     make_streaming: StreamingFactory
     keys_for: Callable[["ScreeningContext", Params], tuple[str, ...]]
+    mirror: Callable[[np.ndarray], np.ndarray] | None = None
 
 
 # --------------------------------------------------------------------------------------------------

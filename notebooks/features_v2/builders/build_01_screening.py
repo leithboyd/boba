@@ -30,16 +30,33 @@ class, per `AUTHORING.md`), register it, then copy this notebook and change §1 
 md(r"""
 ## 1. The feature
 
-`price_dislocation` — how far another venue's price has drifted from the target's: the log price gap,
-smoothed two ways (a fast and a slow leg) and divided by the volatility yardstick `σ_ev`. One leg per
-foreign venue. **Hypothesis:** a fresh gap (fast pulling away from slow) predicts the target's catch-up;
-gaps tend to close. **Disproof:** no predictive power at any time-scale, or power that vanishes once we
-control for the volatility regime. Full definition: `src/boba/features/price_dislocation.py`.
+`price_dislocation` measures how far a foreign source's price has drifted from the target's, in units
+of the target's volatility. One leg per foreign source $s$:
+
+$$
+\text{price\_dislocation}_s \;=\;
+\frac{\mathrm{EMA}_{\text{fast}}(g_s)\,-\,\mathrm{EMA}_{\text{slow}}(g_s)}{\sigma_{\text{ev}}}
+\,,\qquad
+g_s \;=\; \log m_s - \log m_{\text{target}}
+$$
+
+The gap $g_s$ is the log-price difference (foreign mid $m_s$ vs target mid $m_{\text{target}}$);
+**fast − slow** smooths it at two spans on the trade clock ($n_{\text{fast}} < n_{\text{slow}}$), so the
+difference isolates a *fresh* move; dividing by the volatility yardstick $\sigma_{\text{ev}}$ puts the
+score in σ-units. A fan-out feature; `params = (n_fast, n_slow)`.
+
+**Hypothesis** — a fresh gap predicts the target's catch-up; gaps tend to close.
+**Disproof** — no predictive power at any time-scale, or power that vanishes once we control for the
+volatility regime.
+
+Full definition: `src/boba/features/price_dislocation.py`.
 """)
 
 code(r"""
 import numpy as np
 import matplotlib.pyplot as plt
+import polars as pl
+pl.Config.set_fmt_str_lengths(100)                           # show full gate-detail strings (polars truncates at 30 by default)
 from boba.features import base
 import boba.features.price_dislocation                      # registers the feature
 from boba.research.screening import (build_context, parity_check, build_family,

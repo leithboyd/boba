@@ -66,6 +66,19 @@ def _ffill(rx: np.ndarray, val: np.ndarray, t: np.ndarray) -> np.ndarray:
     return np.where(idx < 0, np.nan, val[np.clip(idx, 0, len(val) - 1)])
 
 
+def _active_grid(start_ns: int, end_ns: int, step_ns: int, event_ts: np.ndarray) -> np.ndarray:
+    """Uniform `step_ns` grid over `[start, end)`, keeping only ticks whose preceding window `(t-step, t]`
+    contains at least one event (from `event_ts` — a book update or trade on ANY exchange). A regular
+    cadence that skips dead time: an empty window produces no anchor (we never make an example where
+    nothing happened), while anchors stay on a clean grid rather than jittered onto event timestamps."""
+    grid = np.arange(start_ns, end_ns, step_ns)
+    if len(grid) == 0 or len(event_ts) == 0:
+        return grid[:0]
+    hi = np.searchsorted(event_ts, grid, "right")          # events at-or-before each tick
+    lo = np.searchsorted(event_ts, grid - step_ns, "right")  # events at-or-before the window start
+    return grid[hi > lo]                                   # keep ticks with >= 1 event in (t-step, t]
+
+
 # --------------------------------------------------------------------------------------------------
 # Step 0 — the prepared context.
 # --------------------------------------------------------------------------------------------------
@@ -181,6 +194,8 @@ def build_context(
     horizon_ns: int = 100 * 1_000_000,
     yardstick_span: int = 10_000,
     grid_ms: int = 50,
+    active_only: bool = False,
+    hours: Optional[float] = None,
     warmup_spans: int = 5,
     max_feature_span: int = 10_000,
     raw_stream_cutoff_grid: int = 250_000,
@@ -188,7 +203,16 @@ def build_context(
     """Step 0. Load one block, build the shared trade clock and the causal grid, compute both
     yardsticks and both heads' targets and the regime controls/coordinate, and prepare the raw-event
     stream (bounded to `raw_stream_cutoff_grid` anchors for the parity driver). The SINGLE place data
-    is loaded. `parity_check`'s `n_grid` must be <= `raw_stream_cutoff_grid`."""
+    is loaded. `parity_check`'s `n_grid` must be <= `raw_stream_cutoff_grid`.
+
+    Evaluation grid: a uniform `grid_ms`-spaced wall-clock grid. With `active_only=True` it keeps only the
+    ticks whose preceding `grid_ms` window carried an event (book update or trade) from ANY exchange — a
+    regular cadence that samples activity and skips dead time, so a short-lived, event-coincident feature
+    state is actually sampled (a 50 ms grid catches a ~ms-lived state only ~10% of the time) without
+    flooding the IC with empty-window examples. Lower `grid_ms` (e.g. 1) for finer resolution.
+
+    `hours` limits how much of the block to load — only the first `hours` hours of events (None = the whole
+    block). Use it to iterate quickly, or to keep a fine (`grid_ms=1`, `active_only`) grid to a tractable size."""
     import polars as pl
 
     import boba.io as io
@@ -213,8 +237,16 @@ def build_context(
         td = (load_block(block, f"{ex}_{coin}", "trade").select("rx_time", "prc", "qty")
               .filter((pl.col("prc") > 0) & (pl.col("qty") > 0)))
         trade_ts.append(td["rx_time"].cast(pl.Int64).to_numpy())
+
+    if hours is not None:                                # read only the first `hours` of the block
+        first = [a[0] for a in [mids[e][0] for e in all_ex] + trade_ts if len(a)]
+        cutoff = min(first) + int(hours * 3600 * 1_000_000_000)
+        mids = {e: (rx[rx <= cutoff], m[rx <= cutoff]) for e, (rx, m) in mids.items()}
+        trade_ts = [a[a <= cutoff] for a in trade_ts]
+
     merged_ts = np.unique(np.concatenate(trade_ts))
     n_ticks = len(merged_ts)
+    event_ts = np.unique(np.concatenate([mids[e][0] for e in all_ex] + trade_ts))   # book + trade, any venue
 
     log_mid_target = np.log(_ffill(*mids[target_ex], merged_ts))
 
@@ -243,7 +275,14 @@ def build_context(
     warmup = warmup_spans * max(yardstick_span, max_feature_span)
     if n_ticks <= warmup:
         raise ValueError(f"block too thin: {n_ticks:,} trade ticks <= WARMUP {warmup:,}")
-    anchor_ts = np.arange(merged_ts[warmup], merged_ts[-1] - horizon_ns, grid_ms * 1_000_000)
+    end_ns = merged_ts[-1] - horizon_ns                  # last anchor that keeps a full forward window
+    step_ns = grid_ms * 1_000_000
+    if active_only:                                      # regular grid, but only windows carrying an event
+        anchor_ts = _active_grid(merged_ts[warmup], end_ns, step_ns, event_ts)
+    else:
+        anchor_ts = np.arange(merged_ts[warmup], end_ns, step_ns)
+    if len(anchor_ts) == 0:
+        raise ValueError("empty anchor grid — block too thin for the chosen grid and horizon")
     ctx.anchor_ts = anchor_ts
     ctx.tick_at_anchor = np.searchsorted(merged_ts, anchor_ts, "right") - 1
     ctx.sigma_at_anchor, ctx.lam_at_anchor = ctx.yardsticks_at(anchor_ts, yardstick_span)
@@ -496,15 +535,27 @@ def best_span(
     target: np.ndarray,
     *,
     score_magnitude: bool = False,
+    mirror=None,
 ) -> Params:
     """In-sample span pick: the `params` maximising the mean (over legs) rank-IC against `target`
     (`|leg|` when `score_magnitude`). Used only to give a feature its best shot at the gate — span
-    SELECTION proper is a later step, not screening."""
+    SELECTION proper is a later step, not screening.
+
+    `mirror` (a feature reflection callable, e.g. `FeatureSpec.mirror`) mirror-augments the SIGNED pick —
+    `ic(concat[leg, mirror(leg)], concat[target, -target])` — so the pick is direction-free. Ignored when
+    `score_magnitude` (|·| is sign-blind). See AUTHORING.md → Mirror augmentation."""
     from boba.research import gates as g
+
+    use_mirror = mirror is not None and not score_magnitude
+    aug_target = np.concatenate([target, -target]) if use_mirror else target
+
+    def _ic(v):
+        score = np.abs(v) if score_magnitude else v
+        return g.ic(np.concatenate([score, mirror(score)]), aug_target) if use_mirror else g.ic(score, target)
 
     best, best_score = None, -np.inf
     for p, legs in family.items():
-        s = float(np.nanmean([g.ic(np.abs(v) if score_magnitude else v, target) for v in legs.values()]))
+        s = float(np.nanmean([_ic(v) for v in legs.values()]))
         if np.isfinite(s) and s > best_score:
             best, best_score = p, s
     return best

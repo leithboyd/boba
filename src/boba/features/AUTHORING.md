@@ -33,6 +33,65 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 - **Do use the freshest valid price per source.**
 - **Do treat a feature as a family across time-scales** and let the data assign scales to heads.
 - **Do prove regime-invariance with Gate A — never assume it.** A usable feature reads the *same* in calm and wild markets: scale stable across vol buckets, and neither the signed feature nor its magnitude tracks the regime (monotonically or non-monotonically), against both the vol and rate coordinate. A raw **level** usually *is* the regime and fails — but *measure, don't assume*; a ratio/bounded/normalised form may pass. Never call a feature regime-invariant *or* not until every Gate A number says so.
+- **Do declare the feature's mirror reflection** (`FeatureSpec.mirror`) so the signed-head IC can be mirror-augmented (direction-free). See [Mirror augmentation](#mirror-augmentation).
+
+---
+
+## Mirror augmentation
+
+The market has an **up/down symmetry**: no microstructural law makes rallies behave differently from selloffs. We exploit it as a data augmentation — score the IC (and fit the OOS regression) on the real tape **and on its mirror image**. The mirror image is the whole book + tape **reflected through a fixed price level** `c` (byb's mid at the anchor): geometrically, draw a horizontal line through byb's mid and reflect every price across it.
+
+### Reflecting a book about a fixed level
+
+Work in log-price and reflect each log-price about `ℓ = log c`:  `log p ↦ 2ℓ − log p`. (In price space this is `p ↦ c²/p ≈ 2c − p` for the basis-point moves we deal in — the horizontal-line picture.) Apply it field by field:
+
+| quantity | under the reflection | parity |
+|---|---|---|
+| any log-price | `log p ↦ 2ℓ − log p` | — |
+| **best bid / best ask** | the two sides **swap and reflect**: `bid' = reflect(ask)`, `ask' = reflect(bid)` (the best buy becomes the best sell) | — |
+| **spread** (`ask − bid`) | **unchanged** | even |
+| **mid** | reflects: `log mid ↦ 2ℓ − log mid` | — |
+| **any log-gap or log-return** (a difference of log-prices) | **negates** — the level `ℓ` cancels in the difference | odd |
+| **trade price** | reflects: `log px ↦ 2ℓ − log px` | — |
+| **trade aggressor / side** | **flips**: buy ↔ sell; the signed direction `d ↦ −d` (a buy lifting the ask becomes a sell hitting the bid) | odd |
+| **trade size / volume** (contracts) | **unchanged** — a count, not a price | even |
+| **signed order flow** (`size × direction`, OFI) | **negates** — size invariant, direction flips | odd |
+| **σ_ev, λ_ev, \|gap\|, spread, any magnitude / RMS** | **unchanged** — built from squared or absolute moves | even |
+| **time / the trade clock** | **unchanged** | — |
+
+Two anchors of the picture: the reflection **preserves the spread and every size** (it is a price mirror, not a rescaling), and it **negates every signed price-difference and flips every trade side** — exactly the quantities that carry *direction*.
+
+### A feature's reflection — `FeatureSpec.mirror`
+
+Each feature declares how **its value** transforms, by applying the table above to its inputs (a callable `vec -> reflected vec`):
+
+- **Odd** — built from signed differences / signed flow (a log-gap, a return, a signed imbalance, OFI): the value **negates**, so `mirror = np.negative`. Only odd features carry *signed* (price-head) signal. `price_dislocation` is odd (log-gaps).
+- **Even** — built from magnitudes / sizes / spreads (a volume, a `|gap|`, a spread, σ_ev): the value is **unchanged**, so `mirror = lambda v: v`. An even feature has no signed signal by symmetry — it belongs to the rate head, scored on `|·|`, and is never mirror-augmented.
+- **Undeclared** (`mirror=None`, the default): the feature may not be mirror-augmented; the engines skip it.
+
+In practice `mirror` is the closed-form effect on the value — derive it from the table; you do **not** rebuild the feature from reflected inputs.
+
+### The invariant — required, and tested
+
+`FeatureSpec.mirror` is a *closed-form shortcut* for reflecting the inputs, so it is only correct if it **commutes** with the actual book reflection. This is a hard invariant every feature must satisfy:
+
+```
+mirror(feature(books))  ==  feature(mirror_books(books))
+```
+
+— applying the declared `mirror` to the feature computed on the real books equals recomputing the feature on the **mirror-reflected** books (`mirror_books` = reflect every price through a fixed level per the table above; sizes/clock unchanged). If they disagree, the declared `mirror` is wrong (or the feature has a hidden even/odd-breaking term) and the mirror-augmented IC is meaningless.
+
+**Every feature MUST (a) declare `FeatureSpec.mirror` (never leave it `None`) and (b) ship a test of this commutation invariant** — reflect a synthetic block's books, rebuild, and assert equality to float round-off. See `tests/test_selection.py::test_price_dislocation_mirror_commutes_with_book_reflection` for the pattern (and `test_every_registered_feature_declares_mirror`, which fails any feature that omits the declaration). This is non-negotiable, exactly like the parity check.
+
+### What the engines do, and what it buys
+
+For the **signed price head**, the scorers (`ic_grid`, `best_span`, `second_span_adds`, `per_exchange_vs_single`, and the OOS `gates.wf_ic`) mirror-augment by appending each anchor's reflection — feature legs via `FeatureSpec.mirror`, the signed target via negation — and scoring the union. For the walk-forward the reflection is **interleaved at the same time index** and the embargo doubled, so it shares the anchor's fold. Provable effects (verified in the tests):
+
+- **The IC measures only the odd (direction-consistent) association.** A purely odd relationship is preserved (mirror ≈ plain); a purely even one scores ~0 (no signed signal can be manufactured); a mixed relationship keeps the odd part while the even part adds scatter and **dilutes** the IC — it is *not* cleanly subtracted out.
+- **The OOS regression is forced through the origin** — the symmetric pair drives the intercept to 0, removing a directional/level bias from the fitted model.
+- **No-op for the rate head** — `|·|` is sign-blind (`|−f| = |f|`, the count target is even), so the engines disable mirror whenever they score a magnitude.
+
+**Costs:** it *assumes* the edge is symmetric, so a genuinely **asymmetric** edge (works on rallies, not selloffs) averages away; and the reflection is deterministic, so it **adds no independent information** — use it to make the signed score direction-robust, not to claim significance.
 
 ---
 
@@ -87,3 +146,4 @@ A feature supplies a `FeatureSpec` bundling the two builds with a standard inter
 - Establish the trade-clock EMA convention against a plain one-event-at-a-time loop on a real block, the way `notebooks/03_ema_clock_validation.ipynb` does.
 - Every feature's vectorized and streaming builds are tied together by `boba.research.screening.parity_check` on a real block — to float round-off. A failing parity is almost always one of the rules above broken (a stale read, a double-counted same-timestamp burst, a decay on the wrong clock, or a mis-classified flow/level).
 - Beyond parity (which only proves the two builds agree), validate each feature against an **independent, dead-simple oracle** on a real block — the project's standing validation requirement. The oracle must be implementable from the feature's written definition alone, share no code with the production build, and match it to float32 tolerance.
+- **Test the mirror-augmentation commutation invariant** (`mirror(feature(books)) == feature(mirror_books(books))`) — see [Mirror augmentation](#mirror-augmentation). A feature without a declared, tested `FeatureSpec.mirror` is not done.

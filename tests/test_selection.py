@@ -153,6 +153,22 @@ def test_ic_grid_picks_planted_cell():
         assert (i, j) == (fi, sj), f"{src}: in-sample best {(i, j)} != planted {(fi, sj)}"
 
 
+def test_ic_grid_parallel_matches_sequential():
+    # n_jobs only changes scheduling: the parallel grid must be BIT-IDENTICAL to the sequential one
+    # (each cell writes its own [i, j]; gates.ic is deterministic), incl. the nan triangle.
+    rng = np.random.default_rng(10)
+    n = 8000
+    target = rng.standard_normal(n)
+    fasts, slows = (1, 10, 50, 200), (10, 50, 100, 500)   # overlapping -> a real nan triangle
+    fam = _grid_family(fasts, slows, lambda s, nf, ns: rng.standard_normal(n) + 0.1 * target)
+    for magnitude in (False, True):
+        seq = ic_grid(_empty_ctx(), fam, target, magnitude=magnitude, n_jobs=1)
+        par = ic_grid(_empty_ctx(), fam, target, magnitude=magnitude, n_jobs=8)
+        assert set(seq) == set(par)
+        for src in seq:
+            np.testing.assert_array_equal(seq[src], par[src])   # NaNs compared equal by position
+
+
 def test_ic_grid_magnitude_scores_abs():
     rng = np.random.default_rng(4)
     n = 8000
@@ -332,3 +348,110 @@ def test_real_block_fixed_move_and_second_span():
         assert r["best_alt"] in GRID
         assert isinstance(r["keep"], bool)
         assert np.isfinite(r["oos_solo"]) and np.isfinite(r["oos_joint"])
+
+
+# --------------------------------------------------------------------------------------------------
+# mirror augmentation — feature-driven reflection (AUTHORING.md → Mirror augmentation)
+# --------------------------------------------------------------------------------------------------
+import boba.research.gates as _g
+
+
+def test_ic_grid_mirror_matches_manual_and_magnitude_noop():
+    rng = np.random.default_rng(20)
+    n = 8000
+    target = rng.standard_normal(n)
+    fasts, slows = (1, 10, 50), (10, 50, 100)
+    fam = _grid_family(fasts, slows, lambda s, nf, ns: rng.standard_normal(n) + 0.1 * target)
+    gm = ic_grid(_empty_ctx(), fam, target, mirror=np.negative)
+    # a known valid cell equals the hand-built reflection: ic(concat[v,-v], concat[t,-t])
+    vec = fam[(1, 10)]["aaa"]
+    manual = _g.ic(np.concatenate([vec, -vec]), np.concatenate([target, -target]))
+    assert gm["aaa"][fasts.index(1), slows.index(10)] == pytest.approx(manual, abs=1e-12)
+    # magnitude is sign-blind -> mirror is a no-op (bit-identical, incl. the nan triangle)
+    a = ic_grid(_empty_ctx(), fam, target, magnitude=True, mirror=np.negative)
+    b = ic_grid(_empty_ctx(), fam, target, magnitude=True)
+    for src in a:
+        np.testing.assert_array_equal(a[src], b[src])
+
+
+def test_feature_spec_mirror_declarations():
+    from boba.features.base import FeatureSpec, get
+    import boba.features.price_dislocation  # noqa: F401  (registers the feature)
+
+    assert FeatureSpec.__dataclass_fields__["mirror"].default is None       # undeclared by default
+    assert get("price_dislocation").mirror is np.negative                   # odd in the gap
+
+
+def test_second_span_and_per_exchange_run_with_mirror():
+    rng = np.random.default_rng(21)
+    n = 24000
+    sa, sb = rng.standard_normal(n), rng.standard_normal(n)
+    target = sa - sb + 0.3 * rng.standard_normal(n)
+    fasts, slows = (1, 10), (10, 100)
+    fam = _grid_family(fasts, slows, lambda s, nf, ns: (sa if s == "aaa" else sb) + 0.2 * rng.standard_normal(n))
+    res = second_span_adds(_empty_ctx(), fam, (1, 10), target, mirror=np.negative)
+    for r in res.values():
+        assert r["best_alt"] in [(1, 10), (1, 100), (10, 100)]
+        assert np.isfinite(r["oos_solo"]) and np.isfinite(r["oos_joint"])
+    pc = per_exchange_vs_single(_empty_ctx(), fam, (10, 100), target, mirror=np.negative)
+    assert set(pc) == {"per_exchange", "best_single", "adds_over_single"}
+    assert np.isfinite(pc["per_exchange"])
+
+
+# --------------------------------------------------------------------------------------------------
+# mirror augmentation — the COMMUTATION INVARIANT (AUTHORING.md → Mirror augmentation): applying a
+# feature's declared mirror to the feature must equal recomputing the feature on the mirror-reflected
+# books:   spec.mirror(feature(books)) == feature(mirror_books(books)).  Every feature must satisfy it.
+# --------------------------------------------------------------------------------------------------
+def _commutation_ctx(seed=0, n_ticks=2000):
+    """A synthetic ScreeningContext rich enough to build mid-based features (byb + bin + okx mids on a
+    trade clock, an anchor grid, σ_ev). Quotes start before merged_ts[0] so every mid is finite."""
+    rng = np.random.default_rng(seed)
+    merged_ts = (np.arange(1, n_ticks + 1) * 10).astype(np.int64)
+    mids = {v: ((np.arange(0, n_ticks + 5) * 8).astype(np.int64),
+                100.0 * np.exp(np.cumsum(rng.standard_normal(n_ticks + 5) * 1e-4)))
+            for v in ("byb", "bin", "okx")}
+    anchor_ts = np.arange(int(merged_ts[50]), int(merged_ts[-1]), 30, dtype=np.int64)
+    ctx = _empty_ctx(target="byb_x", sources=("bin", "okx"), merged_ts=merged_ts, anchor_ts=anchor_ts,
+                     tick_at_anchor=np.searchsorted(merged_ts, anchor_ts, "right") - 1,
+                     sigma_at_anchor=np.abs(rng.standard_normal(len(anchor_ts))) * 1e-4 + 1e-5, _mids=mids)
+    ctx.target_logmid_on_clock = np.log(ctx.mid_on_clock("byb"))
+    return ctx
+
+
+def _mirror_books(ctx, c=100.0):
+    """Mirror_Books: reflect every venue's mid through the fixed price level `c` (log mid -> 2 ln c - log
+    mid, i.e. mid -> c**2/mid) — the reflection of the whole book through byb's mid. σ_ev (even) and the
+    clock/anchors are unchanged. The exact data-level operation a feature's `mirror` must commute with."""
+    m = _empty_ctx(target=ctx.target, sources=ctx.sources, merged_ts=ctx.merged_ts, anchor_ts=ctx.anchor_ts,
+                   tick_at_anchor=ctx.tick_at_anchor, sigma_at_anchor=ctx.sigma_at_anchor,
+                   _mids={v: (rx, c * c / mid) for v, (rx, mid) in ctx._mids.items()})
+    m.target_logmid_on_clock = 2.0 * np.log(c) - ctx.target_logmid_on_clock
+    return m
+
+
+def test_price_dislocation_mirror_commutes_with_book_reflection():
+    from boba.features import base
+    import boba.features.price_dislocation  # noqa: F401  (registers)
+
+    ctx = _commutation_ctx()
+    mctx = _mirror_books(ctx)
+    spec = base.get("price_dislocation")
+    for params in [(1, 200), (10, 100), (50, 500), (200, 2000)]:
+        feat = spec.vectorized(ctx, params)            # feature(books)
+        refl = spec.vectorized(mctx, params)           # feature(mirror_books(books))
+        for ex in ctx.sources:
+            lhs = spec.mirror(feat[ex])                # mirror(feature(books))
+            ok = np.isfinite(lhs) & np.isfinite(refl[ex])
+            assert ok.sum() > 100
+            # to float round-off (lfilter EMA recursion; < the 1e-6 parity floor)
+            np.testing.assert_allclose(lhs[ok], refl[ex][ok], rtol=1e-6, atol=1e-9)
+
+
+def test_every_registered_feature_declares_mirror():
+    # The mirror augmentation is a required invariant: every feature must DEFINE its reflection.
+    from boba.features import base
+    import boba.features.price_dislocation  # noqa: F401  (registers)
+
+    for spec in base.all_specs():
+        assert spec.mirror is not None, f"feature {spec.name!r} has no mirror augmentation defined"

@@ -59,17 +59,30 @@ from scipy.stats import rankdata, spearmanr
 _AVG = "average"   # Spearman tie method — average ranks (NEVER ordinal; see module docstring)
 
 
+def _interleave(a, b):
+    """Interleave two equal-length arrays: a -> even rows, b -> odd rows (length 2n). Used by mirror
+    augmentation to place each anchor's reflection at the SAME time index as the anchor."""
+    out = np.empty(2 * len(a), float)
+    out[0::2] = a; out[1::2] = b
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # primitives
 # --------------------------------------------------------------------------------------------------
 
 def ic(x, y, min_n=100):
-    """Masked Spearman rank-IC between two arrays — `nan` if fewer than `min_n` jointly-finite points."""
+    """Masked Spearman rank-IC between two arrays — `nan` if fewer than `min_n` jointly-finite points.
+
+    Mirror augmentation (AUTHORING.md → Mirror augmentation) is applied by the CALLER, by concatenating
+    each input with its reflection before calling this — `ic(concat[x, mirror(x)], concat[y, -y])` — so
+    this primitive stays a plain masked Spearman.
+    """
     finite = np.isfinite(x) & np.isfinite(y)
     return float(spearmanr(x[finite], y[finite]).statistic) if finite.sum() > min_n else float("nan")
 
 
-def wf_folds(features, target, k=6, embargo=2000, min_rows=100):
+def wf_folds(features, target, k=6, embargo=2000, min_rows=100, mirror=None):
     """Purged, expanding-window walk-forward. Yields `(test_mask, oos_prediction)` per fold.
 
     `features` is a list of equal-length arrays (the design columns). The series is split into `k` equal
@@ -78,7 +91,17 @@ def wf_folds(features, target, k=6, embargo=2000, min_rows=100):
     only, fits ordinary least squares, and predicts the segment out-of-sample. Folds with fewer than
     `min_rows` train or test rows are skipped. Causal: only past -> future. (`k` segments -> k-1 OOS folds;
     segment 0 is the initial train-only seed.)
+
+    `mirror` (a feature's reflection callable, e.g. `np.negative`; see AUTHORING.md → Mirror augmentation)
+    mirror-augments the series: each anchor is paired with its reflection — feature columns via `mirror`,
+    the signed target via negation — INTERLEAVED at the same time index, so each reflection shares its
+    row's fold and is purged by the same (doubled) embargo. The OLS then fits through the origin (the
+    symmetric pair forces ~0 intercept) and the OOS rank-IC is direction-free.
     """
+    if mirror is not None:
+        features = [_interleave(np.asarray(f, float), np.asarray(mirror(f), float)) for f in features]
+        t = np.asarray(target, float); target = _interleave(t, -t)
+        embargo = 2 * embargo
     design = np.column_stack(features)
     n_rows = len(target)
     usable = np.isfinite(design).all(axis=1) & np.isfinite(target)
@@ -96,11 +119,15 @@ def wf_folds(features, target, k=6, embargo=2000, min_rows=100):
         yield test_mask, standardised @ coef
 
 
-def wf_ic(features, target, k=6, embargo=2000):
+def wf_ic(features, target, k=6, embargo=2000, mirror=None):
     """Mean out-of-sample rank-IC across the walk-forward folds (the causal OOS gate). `nan` if every fold
-    was skipped (e.g. the embargo exhausts the train history on a tiny series)."""
-    fold_ics = [spearmanr(pred[test].astype(float), target[test]).statistic
-                for test, pred in wf_folds(features, target, k, embargo)]
+    was skipped (e.g. the embargo exhausts the train history on a tiny series). `mirror` (a feature
+    reflection callable) mirror-augments the series — see `wf_folds`."""
+    scored_target = target
+    if mirror is not None:
+        t = np.asarray(target, float); scored_target = _interleave(t, -t)   # the target as wf_folds saw it
+    fold_ics = [spearmanr(pred[test].astype(float), scored_target[test]).statistic
+                for test, pred in wf_folds(features, target, k, embargo, mirror=mirror)]
     return float(np.mean(fold_ics)) if fold_ics else float("nan")
 
 

@@ -14,8 +14,34 @@ from boba.features.base import FeatureSpec
 import boba.features.price_dislocation  # noqa: F401  (registers the feature)
 from boba.research.screening import (
     HeadConfig, LiveYardstick, RawEventStream, ScreeningContext,
-    build_family, parity_check, run_gates,
+    _active_grid, build_family, parity_check, run_gates,
 )
+
+
+# --------------------------------------------------------------------------------------------------
+# event-gated evaluation grid — a regular grid that keeps only windows carrying an event
+# --------------------------------------------------------------------------------------------------
+def test_active_grid_keeps_only_windows_with_events():
+    ms = 1_000_000
+    # events (ms): 2,3,11,50.  Step-5 ms grid over [0,55): keep tick t iff an event lands in (t-5, t]:
+    #   t=5 <- {2,3},  t=15 <- {11},  t=50 <- {50}  -> [5, 15, 50]
+    event_ts = np.array([2, 3, 11, 50], dtype=np.int64) * ms
+    got = _active_grid(0, 55 * ms, 5 * ms, event_ts)
+    np.testing.assert_array_equal(got, np.array([5, 15, 50], dtype=np.int64) * ms)
+    assert np.all(got % (5 * ms) == 0)                    # anchors stay on the regular grid
+
+
+def test_active_grid_empty_when_no_events():
+    np.testing.assert_array_equal(_active_grid(0, 100, 5, np.empty(0, np.int64)), np.empty(0, dtype=float))
+
+
+@pytest.mark.skipif(getattr(io, "DATA_DIR", None) is None, reason="no DATA_DIR configured")
+def test_build_context_hours_caps_data():
+    from boba.research.screening import build_context
+    c = build_context(hours=2)
+    span_ns = int(c.merged_ts[-1] - c.merged_ts[0])
+    assert span_ns <= int(2.1 * 3600 * 1_000_000_000)     # only ~the first 2 h of events were read
+    assert len(c.merged_ts) > 0
 
 
 # --------------------------------------------------------------------------------------------------
@@ -29,8 +55,11 @@ def test_registry_get_and_duplicate():
         base.get("nope")
     dummy = FeatureSpec("dummy_reg_test", spec.vectorized, spec.make_streaming, spec.keys_for)
     base.register(dummy)
-    with pytest.raises(ValueError):           # duplicate name rejected
-        base.register(dummy)
+    try:
+        with pytest.raises(ValueError):       # duplicate name rejected
+            base.register(dummy)
+    finally:
+        base._REGISTRY.pop("dummy_reg_test", None)   # don't leak the dummy into the global registry
 
 
 # --------------------------------------------------------------------------------------------------
