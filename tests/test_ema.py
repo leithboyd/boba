@@ -128,3 +128,52 @@ def test_livefront_is_drop_in_for_kernelmean():
         assert math.isnan(c.value())                       # nan before first commit
         c.tick(); c.add(5.0); c.tick()
         assert math.isfinite(c.value())
+
+
+# --- span == 1 (alpha == 1): the extreme "no memory / no smoothing" case the notebooks' n_fast=1 leg uses ---
+# span=1 -> alpha = 2/(1+1) = 1, so the geometric kernel (1-alpha)^j is 1 at j=0 and 0 for every j>=1:
+# only the current epoch survives. These pin that behavior in the tested library.
+
+def test_kernelmean_span1_only_current_epoch_then_resets():
+    # FLOW, alpha=1: value() is the weight-weighted mean of marks added SINCE the last tick; a tick
+    # decays E,W by (1-alpha)=0, i.e. a full reset -> nothing survives the clock step.
+    f = KernelMeanEMA(1)
+    assert f.alpha == 1.0
+    f.add(3.0, 1.0); f.add(5.0, 3.0)                       # two weighted marks in this epoch
+    assert math.isclose(f.value(), (3 * 1 + 5 * 3) / (1 + 3), abs_tol=1e-12)   # weighted mean of THIS epoch only
+    f.tick()                                               # decay by 0 -> E=W=0
+    assert math.isnan(f.value())                           # nothing remembered past a tick
+    f.add(7.0)
+    assert math.isclose(f.value(), 7.0, abs_tol=1e-12)     # only the fresh epoch counts
+
+
+def test_livefront_span1_reads_latest_no_smoothing():
+    # LEVEL, alpha=1: value() == the freshest observation once committed; no memory of prior values,
+    # and the live front tracks a book update between trades exactly (no smoothing).
+    lf = LiveFrontEMA(1)
+    lf.add(2.0); lf.tick()
+    assert math.isclose(lf.value(), 2.0, abs_tol=1e-12)
+    lf.add(9.0); lf.tick()
+    assert math.isclose(lf.value(), 9.0, abs_tol=1e-12)    # the committed 2.0 is fully forgotten
+    lf.add(4.0)                                            # a fresh book update between trades (no tick)
+    assert math.isclose(lf.value(), 4.0, abs_tol=1e-12)    # live front == latest, not the last committed 9.0
+
+
+def test_livefront_span1_nan_before_first_tick():
+    # warm-up asymmetry: even with alpha=1 and a value added, value() is nan until the first commit
+    # ((1-1)*nan + 1*x -> nan). The notebooks' offline path neutralises this with a 0-fill; pin it here.
+    lf = LiveFrontEMA(1)
+    assert math.isnan(lf.value())                          # nothing added or committed
+    lf.add(5.0)
+    assert math.isnan(lf.value())                          # committed still nan -> live front nan
+    lf.tick()
+    assert math.isclose(lf.value(), 5.0, abs_tol=1e-12)    # first commit -> finite, == latest
+
+
+def test_eventema_span1_is_passthrough():
+    # the composed primitive at alpha=1: step(v) -> value() == v (no memory)
+    e = EventEMA(1)
+    assert e.alpha == 1.0
+    for v in (2.0, -3.0, 11.0):
+        e.step(v)
+        assert math.isclose(e.value(), v, abs_tol=1e-12)
