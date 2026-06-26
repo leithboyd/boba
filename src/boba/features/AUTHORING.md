@@ -91,6 +91,8 @@ For the **signed price head**, the scorers (`ic_grid`, `best_span`, `second_span
 - **The OOS regression is forced through the origin** — the symmetric pair drives the intercept to 0, removing a directional/level bias from the fitted model.
 - **No-op for the rate head** — `|·|` is sign-blind (`|−f| = |f|`, the count target is even), so the engines disable mirror whenever they score a magnitude.
 
+**Beyond the IC — input shaping (step 2).** The same augmentation applies when *shaping* a signed feature for the network: estimate its centre/scale on `concat[f, mirror(f)]`, **not** on the raw feature. A signed feature is symmetric about 0 in the population, so any non-zero centre or skew in one block is mostly a **trend artifact** — shaping on the raw feature bakes that block's drift into the transform, and an asymmetric "fix" would break the very sign-symmetry the model relies on. Mirror-augmenting forces centre 0, skew 0, and an RMS scale. The transform is still *applied* to the raw feature in production; only its estimation uses the symmetrised data. A no-op for an even feature. (`02_finalize.ipynb` §2 does this.)
+
 **Costs:** it *assumes* the edge is symmetric, so a genuinely **asymmetric** edge (works on rallies, not selloffs) averages away; and the reflection is deterministic, so it **adds no independent information** — use it to make the signed score direction-robust, not to claim significance.
 
 ---

@@ -21,7 +21,7 @@ from typing import Optional
 import numpy as np
 
 from boba.ema import LiveFrontEMA
-from boba.features.base import FeatureSpec, Params, register
+from boba.features.base import FeatureSpec, ParamKind, Params, register
 from boba.research.screening import LiveYardstick, ScreeningContext
 
 
@@ -121,6 +121,7 @@ SPEC = FeatureSpec(
     vectorized=vectorized,
     make_streaming=lambda ctx, params: LiveDislocation(ctx, params),
     keys_for=lambda ctx, params: tuple(ctx.sources),
+    param_kind=ParamKind.FAST_SLOW,                          # params = (n_fast, n_slow)
     # Mirror augmentation: reflecting the tape through byb's mid negates this feature. The legs are linear
     # in the log gap and the gap is a price-DIFFERENCE (the reflection level cancels), so gap -> -gap and
     # each leg -> -leg; σ_ev is built from squared byb moves (even), so it is unchanged. Hence the feature

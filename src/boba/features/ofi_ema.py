@@ -19,7 +19,7 @@ from __future__ import annotations
 import numpy as np
 
 from boba.ema import KernelMeanEMA
-from boba.features.base import FeatureSpec, Params, register
+from boba.features.base import FeatureSpec, ParamKind, Params, register
 from boba.research.screening import ScreeningContext
 
 
@@ -106,5 +106,6 @@ SPEC = FeatureSpec(
     make_streaming=lambda ctx, params: LiveOFIEma(ctx, params),
     keys_for=lambda ctx, params: (ctx.target.split("_", 1)[0],) + tuple(ctx.sources),
     mirror=np.negative,   # signed order flow: reflecting the book swaps bid/ask -> the OFI increment negates
+    param_kind=ParamKind.SINGLE,                             # params = N (a single EMA span)
 )
 register(SPEC)

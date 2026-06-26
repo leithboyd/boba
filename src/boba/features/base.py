@@ -29,6 +29,7 @@ extracted from `notebooks/features_v2`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
@@ -36,6 +37,19 @@ import numpy as np
 # A feature-family member is identified by an OPAQUE params token. Examples: a plain EMA -> `N`
 # (int); a fast/slow EMA -> `(n_fast, n_slow)` (tuple). Engines treat it only as a hashable key.
 Params = Any
+
+
+class ParamKind(Enum):
+    """The shape of a feature's `params` token — declared on `FeatureSpec` so the finalize notebook can
+    pick the right span sweep and visualisation WITHOUT a per-feature copy (it must know the shape before
+    it can build the family, so this is declared, not inferred):
+
+      SINGLE     params = N (one EMA span)          -> a 1-D scan over N   (`selection.ic_scan`, a line per leg)
+      FAST_SLOW  params = (n_fast, n_slow)          -> a 2-D fast/slow grid (`selection.ic_grid`, a heatmap per leg)
+    """
+
+    SINGLE = "single"
+    FAST_SLOW = "fast_slow"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -134,6 +148,10 @@ class FeatureSpec:
                       leg through this and negate the signed target to score a direction-free IC. `None`
                       (the default) means the feature has not declared its reflection and may NOT be
                       mirror-augmented — the engines simply skip it.
+    param_kind     -- the shape of the `params` token (`ParamKind`): `SINGLE` (one span `N`) or `FAST_SLOW`
+                      (a `(n_fast, n_slow)` pair). The screening/finalize notebooks read this to build the
+                      right span sweep (1-D scan vs 2-D grid) from ONE shared notebook. Defaults to
+                      `FAST_SLOW` (the common case); a single-span feature must set `SINGLE`.
     """
 
     name: str
@@ -141,6 +159,7 @@ class FeatureSpec:
     make_streaming: StreamingFactory
     keys_for: Callable[["ScreeningContext", Params], tuple[str, ...]]
     mirror: Callable[[np.ndarray], np.ndarray] | None = None
+    param_kind: ParamKind = ParamKind.FAST_SLOW
 
 
 # --------------------------------------------------------------------------------------------------

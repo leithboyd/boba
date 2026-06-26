@@ -102,7 +102,7 @@ def test_fixed_move_targets_matches_oracle():
     assert mags[0] < mags[-1]
 
 
-def test_fixed_move_targets_default_counts():
+def test_fixed_move_targets_returns_supplied_counts():
     rng = np.random.default_rng(1)
     rx = (np.arange(1, 2001) * 10).astype(np.int64)
     moves = rng.random(2000) < 0.7
@@ -111,8 +111,9 @@ def test_fixed_move_targets_default_counts():
     anchor_ts = np.arange(int(rx[40]), int(rx[-40]), 50, dtype=np.int64)
     ctx = _empty_ctx(anchor_ts=anchor_ts, sigma_at_anchor=np.full(len(anchor_ts), 1e-4),
                      _mids={"byb": (rx, mid)}, _mv_rx=rx[moves])
-    got = fixed_move_targets(ctx)
-    assert set(got) == {1, 5, 10, 15, 20, 25, 30}        # default counts
+    counts = (2, 4, 8)
+    got = fixed_move_targets(ctx, counts)
+    assert set(got) == set(counts)                       # caller-supplied counts (no default)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -373,8 +374,9 @@ def test_real_block_fixed_move_and_second_span():
     spec = base.get("price_dislocation")
 
     # fixed-move targets are finite and ordered (a farther move -> a larger typical |return|)
-    fmt = fixed_move_targets(ctx)
-    assert set(fmt) == {1, 5, 10, 15, 20, 25, 30}
+    counts = (1, 5, 10, 15, 20, 25, 30)
+    fmt = fixed_move_targets(ctx, counts)
+    assert set(fmt) == set(counts)
     for n, col in fmt.items():
         assert np.isfinite(col).sum() > 1000
     assert np.nanmean(np.abs(fmt[1])) < np.nanmean(np.abs(fmt[30]))
@@ -496,3 +498,16 @@ def test_every_registered_feature_declares_mirror():
 
     for spec in base.all_specs():
         assert spec.mirror is not None, f"feature {spec.name!r} has no mirror augmentation defined"
+
+
+def test_features_declare_param_kind():
+    # param_kind drives the (1-D vs 2-D) span sweep in the shared screening/finalize notebooks.
+    from boba.features import base
+    from boba.features.base import ParamKind
+    import boba.features.price_dislocation  # noqa: F401
+    import boba.features.ofi_fast_slow       # noqa: F401
+    import boba.features.ofi_ema             # noqa: F401
+
+    assert base.get("price_dislocation").param_kind is ParamKind.FAST_SLOW
+    assert base.get("ofi_fast_slow").param_kind is ParamKind.FAST_SLOW
+    assert base.get("ofi_ema").param_kind is ParamKind.SINGLE

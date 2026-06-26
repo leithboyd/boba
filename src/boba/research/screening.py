@@ -482,8 +482,13 @@ class HeadConfig:
     feature_kind: str = "alpha"
 
     @staticmethod
-    def price(ctx: "ScreeningContext", feature_kind: str = "alpha") -> "HeadConfig":
-        return HeadConfig("price", ctx.price_target, False, None, ctx.sigma_at_anchor, feature_kind)
+    def price(ctx: "ScreeningContext", feature_kind: str = "alpha",
+              target: Optional[np.ndarray] = None) -> "HeadConfig":
+        """The price head. `target` overrides the default 100 ms `ctx.price_target` — pass a
+        count-conditioned `fixed_move_targets[n]` (also σ_ev-divided, so the σ_ev coupling yardstick still
+        applies) to gate against the move-count horizon the IC sweep chose, instead of the wall-clock return."""
+        return HeadConfig("price", ctx.price_target if target is None else target,
+                          False, None, ctx.sigma_at_anchor, feature_kind)
 
     @staticmethod
     def rate(ctx: "ScreeningContext", feature_kind: str = "alpha") -> "HeadConfig":

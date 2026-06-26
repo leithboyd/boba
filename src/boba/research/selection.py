@@ -39,10 +39,11 @@ from boba.research.screening import ScreeningContext, _ffill
 # --------------------------------------------------------------------------------------------------
 def fixed_move_targets(
     ctx: ScreeningContext,
-    counts: tuple[int, ...] = (1, 5, 10, 15, 20, 25, 30),
+    counts: tuple[int, ...],
 ) -> dict[int, np.ndarray]:
     """The price-head targets conditioned on a FIXED number of future target moves, per count `n`.
 
+    `counts` is supplied by the caller (the analysis notebook owns the move-count sweep — no default here).
     For each `n`, the target is the SIGNED return from the anchor's current target mid to the target's
     `n`-th future mid-MOVE, divided by `σ_ev` at the anchor (the volatility yardstick) — `nan` once the
     block runs out of future moves. This is the count-conditioned twin of `ctx.price_target` (which is

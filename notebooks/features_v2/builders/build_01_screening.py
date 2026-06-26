@@ -24,7 +24,9 @@ Everything below is wiring — the machinery is shared, tested code:
 - the **feature** itself: `boba.features.price_dislocation`.
 
 To screen a new feature: write its module under `src/boba/features/` (a vectorized builder + a streaming
-class, per `AUTHORING.md`), register it, then copy this notebook and change §1 and the feature name.
+class, per `AUTHORING.md`), register it with its `param_kind`, then set the `FEATURE` knob below and edit §1.
+The code adapts to the feature's `param_kind` automatically — a 2-D fast/slow grid or a 1-D single-span sweep
+(`price_dislocation` is the worked example below; e.g. `ofi_ema` is a single-span one).
 """)
 
 md(r"""
@@ -59,14 +61,20 @@ import polars as pl
 pl.Config.set_tbl_rows(-1); pl.Config.set_tbl_cols(-1)       # every pl.DataFrame: show ALL rows and columns,
 pl.Config.set_fmt_str_lengths(1000); pl.Config.set_tbl_width_chars(10_000)   # never truncate strings or by width
 from boba.features import base
-import boba.features.price_dislocation                      # registers the feature
+from boba.features.base import ParamKind
+import boba.features.price_dislocation, boba.features.ofi_ema   # register the example features (FAST_SLOW / SINGLE)
 from boba.research.screening import (build_context, parity_check, build_family,
                                      best_span, run_gates, echo_netted_ic, HeadConfig)
+from boba.research.selection import fixed_move_targets, ic_grid, ic_scan
 
-ctx  = build_context()                                       # Step 0: one block -> clock, yardsticks, targets, controls, raw stream
-spec = base.get("price_dislocation")
-print(f"block {ctx.block}")
-print(f"{len(ctx.merged_ts):,} trade ticks   {len(ctx.anchor_ts):,} grid anchors   sources {ctx.sources}")
+FEATURE = "price_dislocation"                                # <- the feature to screen; e.g. "ofi_ema" (the notebook adapts)
+COUNTS  = (1, 3, 5)                                          # fixed mid-move-count horizons for the price head
+ctx  = build_context(grid_ms=1, active_only=True, hours=24)  # 1 ms grid, keep only ms windows with an event (any venue); first 24 h
+spec = base.get(FEATURE)
+IS_2D = spec.param_kind == ParamKind.FAST_SLOW              # fast/slow grid vs single-span family
+KEYS = spec.keys_for(ctx, (1, 100) if IS_2D else 1)         # the feature's leg keys (per-exchange)
+print(f"{FEATURE}  ({spec.param_kind.value})   block {ctx.block}   legs {KEYS}")
+print(f"{len(ctx.merged_ts):,} trade ticks   {len(ctx.anchor_ts):,} grid anchors")
 """)
 
 md(r"""
@@ -77,7 +85,7 @@ floating-point round-off. The generic driver does this for any feature.
 """)
 
 code(r"""
-PARITY_SPANS = [(1, 200), (10, 100)]                         # incl. n_fast=1 (the α=1 / no-smoothing leg)
+PARITY_SPANS = [(1, 200), (10, 100)] if IS_2D else [1, 10]   # 2-D fast/slow pairs, or single spans (incl. the α=1 leg)
 rep = parity_check(ctx, spec, PARITY_SPANS)
 print(rep)
 assert rep.passed, "streaming build does not reproduce the vectorized build"
@@ -88,19 +96,31 @@ md(r"""
 
 Two independent tests per head: **Gate A** (regime-invariant distribution) and **Gate B** (predicts over
 the regime-invariant controls), plus a calm/mid/wild companion. We give the feature its in-sample best
-span per head — span *selection* proper is step 2, not screening.
+span per head — span *selection* proper is step 2, not screening. The **price head gates against the best
+`n`-move-count target** (the move horizon with the strongest IC, mirror-augmented), **not** the 100 ms
+wall-clock return — consistent with `02_finalize`.
 """)
 
 code(r"""
-GRID = [(nf, ns) for nf in (1, 10, 50, 200, 500, 1000)
-                 for ns in (100, 500, 1000, 2000, 5000, 10000) if nf < ns]
+GRID = ([(nf, ns) for nf in (1, 10, 50, 200, 500, 1000)
+                  for ns in (100, 500, 1000, 2000, 5000, 10000) if nf < ns]      # fast/slow grid (FAST_SLOW)
+        if IS_2D else sorted([1, 10, 50, 100, 500, 1000, 2000, 5000, 10000]))    # single-span family (SINGLE)
 family = build_family(ctx, spec.vectorized, GRID, n_jobs=18)
 
-price_span = best_span(ctx, family, ctx.price_target)                          # signed feature -> σ_ev return
-rate_span  = best_span(ctx, family, ctx.rate_target, score_magnitude=True)     # |feature| -> count
-print(f"price-head span {price_span}    rate-head span {rate_span}")
+# price-head TARGET: the fixed-move-count with the strongest signed IC (leg-averaged best span, mirror-
+# augmented) — the same choice as 02. NO 100 ms wall-clock target: we screen against the per-move direction.
+fmt = fixed_move_targets(ctx, COUNTS)
+def _peak_ic(target):
+    res = (ic_grid if IS_2D else ic_scan)(ctx, family, target, n_jobs=18, mirror=spec.mirror)
+    return float(np.nanmean([np.nanmax(res[leg]) for leg in KEYS]))
+best_n = max(COUNTS, key=lambda n: _peak_ic(fmt[n]))                           # the strongest move-count horizon
+price_target = fmt[best_n]                                                     # count-conditioned price-head target
 
-gr_price = run_gates(family[price_span], ctx, HeadConfig.price(ctx))
+price_span = best_span(ctx, family, price_target, mirror=spec.mirror)          # signed feature -> n-move return
+rate_span  = best_span(ctx, family, ctx.rate_target, score_magnitude=True)     # |feature| -> count
+print(f"price head: best move-count n={best_n}    span {price_span}    rate-head span {rate_span}")
+
+gr_price = run_gates(family[price_span], ctx, HeadConfig.price(ctx, target=price_target))   # gate vs the n-move target
 gr_rate  = run_gates(family[rate_span],  ctx, HeadConfig.rate(ctx))
 gr_price.to_polars()
 """)
@@ -117,7 +137,7 @@ A causal feature can still fail to predict if its edge is the move already under
 """)
 
 code(r"""
-src = ctx.sources[0]                                         # one venue shown; each carries its own
+src = KEYS[0]                                                # one leg shown; each carries its own
 e = echo_netted_ic(ctx, family[price_span][src])
 vals = [e["raw"], e["backward"], e["netted"]]
 fig, ax = plt.subplots(figsize=(6, 4))
