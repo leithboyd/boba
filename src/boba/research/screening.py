@@ -22,7 +22,7 @@ from typing import Optional
 import numpy as np
 
 from boba.ema import KernelMeanEMA
-from boba.features.base import FeatureSpec, Params, VectorizedBuilder
+from boba.features.base import BookEvent, FeatureSpec, Params, TradeEvent, VectorizedBuilder
 
 
 # --------------------------------------------------------------------------------------------------
@@ -85,8 +85,10 @@ def _active_grid(start_ns: int, end_ns: int, step_ns: int, event_ts: np.ndarray)
 @dataclass
 class RawEventStream:
     """The block's book + trade events, all sources, in receive-time order, integer-coded — what the
-    streaming parity driver replays. `lid` indexes `listings`; `kind` is 0=book, 1=trade; for a book
-    event `(a, b) = (bid, ask)`, for a trade `(a, b) = (px, lifts_ask)`. Feature-agnostic."""
+    streaming parity driver replays. `lid` indexes `listings`; `kind` is 0=book, 1=trade. Four payload
+    columns `(a, b, c, d)` carry every event prop: a book event is `(bid, ask, bid_qty, ask_qty)`, a
+    trade is `(px, lifts_ask, qty, nan)`. The driver packs them into a `BookEvent` / `TradeEvent` per
+    event, so adding a future prop is a new column here, never a signature change. Feature-agnostic."""
 
     rx: np.ndarray
     kind: np.ndarray
@@ -94,6 +96,8 @@ class RawEventStream:
     t: np.ndarray
     a: np.ndarray
     b: np.ndarray
+    c: np.ndarray
+    d: np.ndarray
     listings: tuple[str, ...]
 
 
@@ -137,6 +141,7 @@ class ScreeningContext:
 
     # --- building blocks a feature derives its inputs from (kept here so build_context loads once) ---
     _mids: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict, repr=False)
+    _books: dict[str, tuple] = field(default_factory=dict, repr=False)  # raw front_levels per ex: (rx, bid, bid_qty, ask, ask_qty)
     target_logmid_on_clock: np.ndarray = field(default=None, repr=False)  # log target mid at each tick
     _mv_rx: np.ndarray = field(default=None, repr=False)                  # target move timestamps
     _mv_r2: np.ndarray = field(default=None, repr=False)                  # squared target moves
@@ -153,13 +158,14 @@ class ScreeningContext:
         rx, mid = self._mids[source]
         return _ffill(rx, mid, self.anchor_ts)
 
-    def _flow_at(self, anchors: np.ndarray, val: np.ndarray, span: float) -> np.ndarray:
-        """EWMA of `val` over the target-MOVE stream, decayed once per trade-timestamp, read AT each
-        anchor (committed-per-trade EMA + the partial epoch since the last trade)."""
+    def _flow_at(self, anchors: np.ndarray, val: np.ndarray, span: float, src_rx: np.ndarray = None) -> np.ndarray:
+        """EWMA of `val` over an EVENT stream `src_rx` (default the target-MOVE stream `_mv_rx`), decayed
+        once per trade-timestamp, read AT each anchor (committed-per-trade EMA + the partial epoch since
+        the last trade). `val` is aligned to `src_rx`. Reused by any sparse flow (σ_ev, OFI, …)."""
         from scipy.signal import lfilter
 
         a = 2.0 / (span + 1.0)
-        mv_rx = self._mv_rx
+        mv_rx = self._mv_rx if src_rx is None else src_rx
         n_ticks = len(self.merged_ts)
         k = np.searchsorted(self.merged_ts, mv_rx, "left")
         ep = np.bincount(k, weights=val, minlength=n_ticks + 1)
@@ -231,6 +237,17 @@ def build_context(
 
     mids = {ex: load_mid(ex) for ex in all_ex}
 
+    def load_book(ex):                                   # raw front_levels WITH sizes (snapshot qty) — for OFI etc.
+        # SAME row set as this venue's mid load: merged venues fuse by exch_time (require it), book-only
+        # venues don't — so byb/okx match the existing front_levels load and bin matches load_mid exactly.
+        subset = ["rx_time", "bid_prc", "ask_prc"] + (["exchange_time"] if mid_stream[ex] == "merged_levels" else [])
+        df = (load_block(block, f"{ex}_{coin}", "front_levels")
+              .select("rx_time", "exchange_time", "bid_prc", "bid_qty", "ask_prc", "ask_qty").drop_nulls(subset))
+        return (df["rx_time"].cast(pl.Int64).to_numpy(), df["exchange_time"].cast(pl.Int64).to_numpy(),
+                df["bid_prc"].to_numpy(), df["bid_qty"].to_numpy(), df["ask_prc"].to_numpy(), df["ask_qty"].to_numpy())
+
+    books_raw = {ex: load_book(ex) for ex in all_ex}     # (rx, exch_time, bid, bid_qty, ask, ask_qty) per venue
+
     # shared trade clock: one tick per trade-TIMESTAMP across all venues (simultaneous prints = one tick)
     trade_ts = []
     for ex in all_ex:
@@ -242,7 +259,11 @@ def build_context(
         first = [a[0] for a in [mids[e][0] for e in all_ex] + trade_ts if len(a)]
         cutoff = min(first) + int(hours * 3600 * 1_000_000_000)
         mids = {e: (rx[rx <= cutoff], m[rx <= cutoff]) for e, (rx, m) in mids.items()}
+        books_raw = {e: tuple(col[b[0] <= cutoff] for col in b) for e, b in books_raw.items()}
         trade_ts = [a[a <= cutoff] for a in trade_ts]
+
+    # books a feature consumes (drop exchange_time, which only the raw-event stream below needs)
+    books = {e: (rx, bid, bq, ask, aq) for e, (rx, _et, bid, bq, ask, aq) in books_raw.items()}
 
     merged_ts = np.unique(np.concatenate(trade_ts))
     n_ticks = len(merged_ts)
@@ -267,8 +288,8 @@ def build_context(
         merged_ts=merged_ts, anchor_ts=np.empty(0), tick_at_anchor=np.empty(0),
         sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0), price_target=np.empty(0), rate_target=np.empty(0),
         base=[], vol_level=np.empty(0), rate_level=np.empty(0), vol_regime=np.empty(0),
-        raw_events=RawEventStream(*([np.empty(0)] * 6), ()), _mids=mids, target_logmid_on_clock=log_mid_target,
-        _mv_rx=mv_rx, _mv_r2=mv_r2, _clock_dt=clock_dt,
+        raw_events=RawEventStream(*([np.empty(0)] * 8), ()), _mids=mids, _books=books,
+        target_logmid_on_clock=log_mid_target, _mv_rx=mv_rx, _mv_r2=mv_r2, _clock_dt=clock_dt,
     )
 
     # causal grid past warm-up
@@ -313,33 +334,30 @@ def build_context(
     # prepared raw-event stream (bounded), integer-coded, receive-time order, book-before-trade on ties
     listings = tuple(f"{ex}_{coin}" for ex in all_ex)        # index = lid
     cutoff = int(anchor_ts[min(raw_stream_cutoff_grid, len(anchor_ts) - 1)])
-    cols: dict[str, list] = {k: [] for k in "rx kind lid t a b".split()}
+    cols: dict[str, list] = {k: [] for k in "rx kind lid t a b c d".split()}
 
-    def add(rx, kind, lid, t, a, b):
-        m = rx <= cutoff
-        cols["rx"].append(rx[m]); cols["kind"].append(np.full(int(m.sum()), kind, np.int8))
-        cols["lid"].append(np.full(int(m.sum()), lid, np.int8))
-        cols["t"].append(t[m]); cols["a"].append(a[m].astype(float)); cols["b"].append(b[m].astype(float))
+    def add(rx, kind, lid, t, a, b, c, d):                  # book: (bid, ask, bid_qty, ask_qty); trade: (px, lifts_ask, qty, nan)
+        m = rx <= cutoff; n = int(m.sum())
+        cols["rx"].append(rx[m]); cols["kind"].append(np.full(n, kind, np.int8)); cols["lid"].append(np.full(n, lid, np.int8))
+        cols["t"].append(t[m])
+        for k, v in (("a", a), ("b", b), ("c", c), ("d", d)):
+            cols[k].append(v[m].astype(float))
 
-    for lid, ex in enumerate(all_ex):
-        if mid_stream[ex] == "merged_levels":               # raw front_levels (bid/ask + exch time); they fuse trades
-            fl = load_block(block, f"{ex}_{coin}", "front_levels").select(
-                "rx_time", "exchange_time", "bid_prc", "ask_prc").drop_nulls()
-            add(fl["rx_time"].cast(pl.Int64).to_numpy(), 0, lid, fl["exchange_time"].cast(pl.Int64).to_numpy(),
-                fl["bid_prc"].to_numpy(), fl["ask_prc"].to_numpy())
-        else:                                               # book-only venue: its mid fed as bid=ask=mid
-            rx, mid = mids[ex]
-            add(rx, 0, lid, rx, mid, mid)
+    for lid, ex in enumerate(all_ex):                       # every venue's REAL front_levels book (bid/ask + sizes);
+        rx, et, bid, bq, ask, aq = books_raw[ex]            # merged venues fuse trades into it; book-only take the snapshot.
+        add(rx, 0, lid, et, bid, ask, bq, aq)              # same array as `_books` -> OFI vectorized/streaming see one stream
     for lid, ex in enumerate(all_ex):                       # trades from every venue tick the clock; merged venues fuse
         td = (load_block(block, f"{ex}_{coin}", "trade")
               .select("rx_time", "exchange_time", "prc", "qty", "aggressor")
               .filter((pl.col("prc") > 0) & (pl.col("qty") > 0)))
-        add(td["rx_time"].cast(pl.Int64).to_numpy(), 1, lid, td["exchange_time"].cast(pl.Int64).to_numpy(),
-            td["prc"].to_numpy(), io._trade_lifts_ask(f"{ex}_{coin}", td["aggressor"].to_numpy()).astype(float))
+        rx = td["rx_time"].cast(pl.Int64).to_numpy()
+        add(rx, 1, lid, td["exchange_time"].cast(pl.Int64).to_numpy(), td["prc"].to_numpy(),
+            io._trade_lifts_ask(f"{ex}_{coin}", td["aggressor"].to_numpy()).astype(float),
+            td["qty"].to_numpy(), np.full(len(rx), np.nan))
 
     C = {k: np.concatenate(v) for k, v in cols.items()}
     order = np.lexsort((C["kind"], C["rx"]))                # rx asc; book(0) before trade(1) on ties
-    ctx.raw_events = RawEventStream(*(C[k][order] for k in "rx kind lid t a b".split()), listings)
+    ctx.raw_events = RawEventStream(*(C[k][order] for k in "rx kind lid t a b c d".split()), listings)
     return ctx
 
 
@@ -400,7 +418,7 @@ def parity_check(
 
     ev = ctx.raw_events
     rxL = ev.rx.tolist(); kindL = ev.kind.tolist(); lidL = ev.lid.tolist()
-    tL = ev.t.tolist(); aL = ev.a.tolist(); bL = ev.b.tolist()
+    tL = ev.t.tolist(); aL = ev.a.tolist(); bL = ev.b.tolist(); cL = ev.c.tolist(); dL = ev.d.tolist()
     listings = ev.listings
     n = len(rxL); i = 0; ai = 0
 
@@ -416,11 +434,15 @@ def parity_check(
         while ai < na and anchor[ai] < rx:
             read(ai); ai += 1
         while i < n and rxL[i] == rx:
-            for f in feats.values():
-                if kindL[i] == 0:
-                    f.on_book(listings[lidL[i]], tL[i], aL[i], bL[i])
-                else:
-                    f.on_trade(listings[lidL[i]], tL[i], aL[i], bL[i])
+            listing = listings[lidL[i]]
+            if kindL[i] == 0:
+                bev = BookEvent(listing, tL[i], aL[i], bL[i], cL[i], dL[i])   # build once, share across features
+                for f in feats.values():
+                    f.on_book(bev)
+            else:
+                tev = TradeEvent(listing, tL[i], aL[i], bL[i], cL[i])
+                for f in feats.values():
+                    f.on_trade(tev)
             i += 1
         for f in feats.values():
             f.refresh()

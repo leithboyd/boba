@@ -30,7 +30,7 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 - **Do build every average by the EMA contract** — which class and when to inject vs decay are specified in [EMA construction](#ema-construction) below; the parity check enforces it.
 - **Do test against both heads — but feed both the *signed* feature.** Check whether the signed feature predicts *direction* (price head) and whether its *magnitude* predicts *intensity* (rate head). Those are diagnostics — the model is fed the **signed** feature to *both* heads, never a pre-computed `|feature|` (which would destroy the sign and the cancel/reinforce interaction the rate head learns).
 - **Do score out-of-sample** with a purged, embargoed walk-forward (strictly past→future), the embargo sized to clear the outcome window — *because* overlapping forward labels let a train row's outcome window straddle the train/test boundary and leak the future, inflating the OOS IC. A single split is only a faster screen.
-- **Do use the freshest valid price per source.**
+- **Do use the freshest valid price per source** — read the trade-fused `merged_levels` mid where the venue benefits; see [Price source](#price-source--fresh-mids-vs-raw-sizes).
 - **Do treat a feature as a family across time-scales** and let the data assign scales to heads.
 - **Do prove regime-invariance with Gate A — never assume it.** A usable feature reads the *same* in calm and wild markets: scale stable across vol buckets, and neither the signed feature nor its magnitude tracks the regime (monotonically or non-monotonically), against both the vol and rate coordinate. A raw **level** usually *is* the regime and fails — but *measure, don't assume*; a ratio/bounded/normalised form may pass. Never call a feature regime-invariant *or* not until every Gate A number says so.
 - **Do declare the feature's mirror reflection** (`FeatureSpec.mirror`) so the signed-head IC can be mirror-augmented (direction-free). See [Mirror augmentation](#mirror-augmentation).
@@ -138,6 +138,17 @@ A feature supplies a `FeatureSpec` bundling the two builds with a standard inter
   - `refresh()` runs **once per receive-timestamp**, after all that timestamp's events are applied: update each level's live front and inject each flow's one sample, then advance the trade clock **at most once** (decay; commit each level) iff a trade landed.
   - `value()` returns `{leg_key -> scalar}` — the live front at the instant it is read; its keys must match the vectorized builder's dict keys for the same `params`.
   - **Compose `boba.research.screening.LiveYardstick`** rather than recomputing `σ_ev` / `λ_ev`, so yardstick parity is established once in the test suite and your feature's parity validates only the feature-specific maths.
+
+---
+
+## Price source — fresh mids vs raw sizes
+
+A venue's raw BBO (`front_levels`) is a *slow sampler* of top-of-book on the slow feeds (byb/okx refresh only every ~10–20 ms; p90 100–160 ms). `boba.io`'s **`merged_levels`** fuses trade prints into the book — holding, per side, the **newest-by-exchange-time** price among {BBO snapshots, qualifying trades (`prc>0 & qty>0`)} — for a *fresher* top-of-book **price**. A trade updates the side it **lifts**, and that aggressor→side map is **venue-specific** (Binance *spot* inverts it — a `Bid`-aggressor is a SELL that hits the bid), so rely on the raw stream's `lifts_ask` (from `io._trade_lifts_ask`), never a hardcoded `Bid → ask`. The merge is deliberately **price-only** — it carries no `qty` (forwarding a snapshot's size is a stale-data trap) — and because the two sides fuse *independently* the book can transiently **cross** (`ask < bid`, ~0.1–0.3% of rows): don't assume `ask ≥ bid`; clamp/skip if you need an uncrossed book. So choose the price source by what the feature reads:
+
+- **Needs only prices** (a mid, a cross-venue gap, a microprice numerator): use **`merged_levels`** — *but only where the venue/instrument benefits*. The fusion is a big win for the slow feeds (byb/okx) and **hurts** an already-sub-ms feed, so it is **disallowed for bin perp** in `boba.io` (it raises; bin *spot* is slower and ~neutral, so allowed). Encode this per listing (the `mid_stream` / fuse-trades policy), never as a blanket choice.
+  - **Vectorized:** just read the prepared fused stream (e.g. `ctx.mid_on_clock` / `ctx.mid_at_anchor`, which `build_context` loads per the policy) — don't re-derive it.
+  - **Streaming:** **replicate the merge from raw events** — hold the newest-by-exchange-time price per side as `on_book` (snapshots) and `on_trade` (the side `ev.lifts_ask` marks — already venue-corrected) arrive, applying the fuse policy only to the listings that use it. The parity check ties your inline fusion to `io.py`'s `merged_levels` to round-off. `price_dislocation` is the worked example.
+- **Needs sizes** (OFI, queue/volume imbalance, depth): `merged_levels` can't help — it has no `qty`. Read **raw `front_levels`** (snapshot bid/ask **and** bid_qty/ask_qty) via `ctx._books`; the sizes are snapshot-stale between refreshes, which is inherent to the data. `ofi_fast_slow` / `ofi_ema` are the worked examples.
 
 ---
 

@@ -147,6 +147,47 @@ def ic_grid(
     return grids
 
 
+def ic_scan(
+    ctx: ScreeningContext,
+    family: dict[Params, dict[str, np.ndarray]],
+    target: np.ndarray,
+    *,
+    magnitude: bool = False,
+    n_jobs: int = 1,
+    mirror=None,
+) -> dict[str, np.ndarray]:
+    """In-sample masked rank-IC of every family member vs `target`, as a 1-D array over the sorted span
+    params, per source — the single-span (`params = N`, e.g. `ofi_ema`) analog of `ic_grid`. `out[src][i]`
+    is `gates.ic` of the `sorted(family)[i]` member of that source. `magnitude`, `n_jobs`, and `mirror`
+    behave exactly as in `ic_grid` (the parallel/mirror-augmented scoring is shared). The array's `nanargmax`
+    is the in-sample span pick (used ONLY to pick a time-scale, never as an OOS claim)."""
+    from boba.research import gates as g
+
+    spans = sorted(family)
+    sources = sorted({s for legs in family.values() for s in legs})
+    out = {s: np.full(len(spans), np.nan) for s in sources}
+    use_mirror = mirror is not None and not magnitude
+    aug_target = np.concatenate([target, -target]) if use_mirror else target
+
+    jobs = [(i, src, family[n][src]) for i, n in enumerate(spans) for src in family[n]]
+
+    def _score(job):
+        i, src, vec = job
+        score = np.abs(vec) if magnitude else vec
+        if use_mirror:
+            score = np.concatenate([score, mirror(score)])
+        return i, src, g.ic(score, aug_target)
+
+    if n_jobs > 1 and len(jobs) > 1:
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            results = list(pool.map(_score, jobs))
+    else:
+        results = [_score(job) for job in jobs]
+    for i, src, val in results:
+        out[src][i] = val
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # §7 — partial-IC (controls for the chosen span). Composed from gates.ic on a COMMON mask, exactly
 # like screening._partial_ic — the one allowed hand-composition (a partial of the tested masked IC).

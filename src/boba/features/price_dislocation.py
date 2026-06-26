@@ -82,15 +82,16 @@ class LiveDislocation:
         b, a = self.bid.get(listing), self.ask.get(listing)
         return None if b is None or a is None else 0.5 * (b + a)
 
-    def on_book(self, listing: str, exch_time: int, bid: float, ask: float) -> None:
+    def on_book(self, ev) -> None:                  # uses only prices; sizes (ev.bid_qty/ask_qty) ignored
+        listing = ev.listing
         if listing in self.fuse_trades:
-            self._side(listing, False, bid, exch_time); self._side(listing, True, ask, exch_time)
+            self._side(listing, False, ev.bid, ev.exch_time); self._side(listing, True, ev.ask, ev.exch_time)
         else:
-            self.bid[listing] = bid; self.ask[listing] = ask
+            self.bid[listing] = ev.bid; self.ask[listing] = ev.ask
 
-    def on_trade(self, listing: str, exch_time: int, px: float, lifts_ask) -> None:
-        if listing in self.fuse_trades:
-            self._side(listing, lifts_ask, px, exch_time)
+    def on_trade(self, ev) -> None:
+        if ev.listing in self.fuse_trades:
+            self._side(ev.listing, ev.lifts_ask, ev.px, ev.exch_time)
         self.was_trade_present = True
 
     def refresh(self) -> None:

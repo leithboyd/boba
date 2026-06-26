@@ -123,10 +123,10 @@ def _live_mid_spec():
             self._key = {f"{s}_{ctx.coin}": s for s in ctx.sources}
             self._m: dict = {}
 
-        def on_book(self, listing, exch_time, bid, ask):
-            self._m[listing] = 0.5 * (bid + ask)
+        def on_book(self, ev):
+            self._m[ev.listing] = 0.5 * (ev.bid + ev.ask)
 
-        def on_trade(self, listing, exch_time, px, lifts_ask):
+        def on_trade(self, ev):
             pass
 
         def refresh(self):
@@ -151,8 +151,10 @@ def _synthetic_event_ctx():
     kind = np.zeros(len(rx), np.int8)
     lid = np.concatenate([np.zeros(len(rx_a), np.int8), np.ones(len(rx_b), np.int8)])
     a = np.concatenate([mid_a, mid_b]); b = a.copy(); t = rx.astype(np.int64)
+    c = np.full(len(rx), np.nan); d = c.copy()                    # book events carry no sizes here
     order = np.lexsort((kind, rx))
-    raw = RawEventStream(rx[order], kind[order], lid[order], t[order], a[order], b[order], ("aaa_x", "bbb_x"))
+    raw = RawEventStream(rx[order], kind[order], lid[order], t[order], a[order], b[order],
+                         c[order], d[order], ("aaa_x", "bbb_x"))
     anchor_ts = np.array([25, 45, 65, 85, 95], np.int64)
     return ScreeningContext(
         block="syn", coin=coin, target="aaa_x", sources=sources, horizon_ns=0, yardstick_span=10,
@@ -197,7 +199,7 @@ def _gate_ctx(n=20000, seed=0):
         sigma_at_anchor=np.exp(0.3 * vol_level), lam_at_anchor=np.exp(0.3 * rate_level),
         price_target=pt, rate_target=rng.standard_normal(n), base=base_controls,
         vol_level=vol_level, rate_level=rate_level, vol_regime=vol_regime,
-        raw_events=RawEventStream(*([np.empty(0)] * 6), ()))
+        raw_events=RawEventStream(*([np.empty(0)] * 8), ()))
     return ctx, pt, rng
 
 
@@ -255,7 +257,7 @@ def test_echo_netted_ic_real_vs_echo():
         mid_stream={}, merged_ts=np.empty(0), anchor_ts=anchors, tick_at_anchor=np.empty(0),
         sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0), price_target=np.empty(0),
         rate_target=np.empty(0), base=[], vol_level=np.empty(0), rate_level=np.empty(0),
-        vol_regime=np.empty(0), raw_events=RawEventStream(*([np.empty(0)] * 6), ()), _mids={"byb": (rx, mid)})
+        vol_regime=np.empty(0), raw_events=RawEventStream(*([np.empty(0)] * 8), ()), _mids={"byb": (rx, mid)})
     fwd = np.log(_ffill(rx, mid, anchors + H) / _ffill(rx, mid, anchors))
     trail = np.log(_ffill(rx, mid, anchors) / _ffill(rx, mid, anchors - H))
     real = echo_netted_ic(ctx, fwd)                 # a leg that IS the forward move: survives netting

@@ -1,8 +1,10 @@
-"""Generate notebooks/features_v2/02_finalize.ipynb — step 2 of feature analysis (finalize):
-it passed screening; now pick the time-scale per head, shape the input, decide single-vs-per-exchange, and ship.
+"""Generate notebooks/features_v2/02_finalize_2d.ipynb — step 2 of feature analysis (finalize) for a
+feature with a 2-D param (a fast/slow span pair, e.g. price_dislocation): it passed screening; now pick
+the time-scale per head, shape the input, decide single-vs-per-exchange, and ship.
 
-All the implementation lives in shared, tested code (boba.research.selection + boba.research.shaping);
-this notebook is just wiring, visualisation, and the ship checklist."""
+The 1-D-param sibling (a single span, e.g. ofi_ema) is build_02_finalize_1d.py. All the implementation
+lives in shared, tested code (boba.research.selection + boba.research.shaping); this notebook is just
+wiring, visualisation, and the ship checklist."""
 import json
 from pathlib import Path
 
@@ -11,11 +13,14 @@ def md(s):   cells.append(("markdown", s.strip("\n")))
 def code(s): cells.append(("code", s.strip("\n")))
 
 md(r"""
-# Finalize `price_dislocation` for the model
+# Finalize `price_dislocation` for the model — a fast/slow (2-D param) feature
 
 `price_dislocation` **cleared screening** ([`01_screening.ipynb`](01_screening.ipynb)) — it is computed
 correctly and carries real signal for both heads. This is **step 2 — finalize it for the model**: pick the
 time-scale per head, shape the feature for the network, decide single-vs-per-exchange, and run the ship checklist.
+
+This is the **2-D-param** version (the span family is a fast/slow grid). For a single-span feature (one EMA,
+e.g. `ofi_ema`), use [`02_finalize_1d.ipynb`](02_finalize_1d.ipynb), which sweeps one span instead of a grid.
 
 Wiring only — the engines are shared, tested code: span/head selection (`boba.research.selection`), input
 shaping (`boba.research.shaping`). The **method** is in [`METHOD.md`](METHOD.md).
@@ -32,6 +37,8 @@ code(r"""
 import numpy as np
 import matplotlib.pyplot as plt
 import polars as pl
+pl.Config.set_tbl_rows(-1); pl.Config.set_tbl_cols(-1)       # every pl.DataFrame: show ALL rows and columns,
+pl.Config.set_fmt_str_lengths(1000); pl.Config.set_tbl_width_chars(10_000)   # never truncate strings or by width
 from boba.features import base
 import boba.features.price_dislocation                      # registers the feature
 from boba.research.screening import build_context, build_family, best_span
@@ -43,8 +50,9 @@ spec = base.get("price_dislocation")
 GRID = [(nf, ns) for nf in (1, 10, 50, 200, 500, 1000)
                  for ns in (100, 500, 1000, 2000, 5000, 10000) if nf < ns]
 FAST = sorted({nf for nf, ns in GRID}); SLOW = sorted({ns for nf, ns in GRID})
-family = build_family(ctx, spec.vectorized, GRID, n_jobs=18)                  # {(nf,ns): {source: vector}}
-print(f"block {ctx.block}   {len(GRID)} spans   sources {ctx.sources}")
+KEYS = spec.keys_for(ctx, GRID[0])                          # the feature's leg keys (per-exchange) — works for any feature
+family = build_family(ctx, spec.vectorized, GRID, n_jobs=18)                  # {(nf,ns): {leg: vector}}
+print(f"block {ctx.block}   {len(GRID)} spans   feature legs {KEYS}")
 print(f"{len(ctx.anchor_ts):,} examples (anchors) on the event-gated grid   from {len(ctx.merged_ts):,} trade ticks")
 
 def show_grids(grids, title):                                                # the only viz helper (§7 plotter)
@@ -97,10 +105,11 @@ show_grids(rate_grid, "rate head: |feature| -> move count")                  # .
 """)
 
 code(r"""
-# best (fast, slow) PER EXCHANGE per diagnostic — each source's OWN in-sample argmax (no exchange is
-# privileged; a representative scale, not an OOS claim). One row per diagnostic; span + its rank-IC per source.
-def _best_ex(grid, src):
-    g = grid[src]; i, j = np.unravel_index(np.nanargmax(g), g.shape)
+# best (fast, slow) PER LEG per diagnostic — each leg's OWN in-sample argmax (no leg is privileged; a
+# representative scale, not an OOS claim). One row per diagnostic; span + its rank-IC per leg. The legs are
+# the feature's own keys (`spec.keys_for`), so this works for any feature (per-exchange, single, fan-out).
+def _best_ex(grid, leg):
+    g = grid[leg]; i, j = np.unravel_index(np.nanargmax(g), g.shape)
     return (FAST[i], SLOW[j]), float(g[i, j])
 diagnostics = ([(f"price n={n} signed",    signed[n]) for n in fmt]
              + [(f"price n={n} |feature|", magnit[n]) for n in fmt]
@@ -108,9 +117,9 @@ diagnostics = ([(f"price n={n} signed",    signed[n]) for n in fmt]
 rows = []
 for name, grid in diagnostics:
     row = {"diagnostic": name}
-    for s in ctx.sources:
-        span, icv = _best_ex(grid, s)
-        row[f"{s} span"] = str(span); row[f"{s} IC"] = round(icv, 3)
+    for leg in KEYS:
+        span, icv = _best_ex(grid, leg)
+        row[f"{leg} span"] = str(span); row[f"{leg} IC"] = round(icv, 3)
     rows.append(row)
 pl.DataFrame(rows)
 """)
@@ -132,7 +141,7 @@ with the **lightest** transform that clears the bar.
 """)
 
 code(r"""
-src = ctx.sources[0]                                                          # one source shown; same recipe for each
+src = KEYS[0]                                                                 # one leg shown; same recipe for each
 f = family[price_span][src]
 rep = shaping_report(f)
 print(rep)
@@ -192,6 +201,6 @@ nb = {
                  "language_info": {"name": "python"}},
     "nbformat": 4, "nbformat_minor": 5,
 }
-out = Path(__file__).resolve().parents[1] / "02_finalize.ipynb"   # notebooks/features_v2/02_finalize.ipynb
+out = Path(__file__).resolve().parents[1] / "02_finalize_2d.ipynb"   # notebooks/features_v2/02_finalize_2d.ipynb
 out.write_text(json.dumps(nb, indent=1) + "\n")
 print("wrote", out, "with", len(cells), "cells")

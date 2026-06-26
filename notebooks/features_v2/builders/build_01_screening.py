@@ -56,7 +56,8 @@ code(r"""
 import numpy as np
 import matplotlib.pyplot as plt
 import polars as pl
-pl.Config.set_fmt_str_lengths(100)                           # show full gate-detail strings (polars truncates at 30 by default)
+pl.Config.set_tbl_rows(-1); pl.Config.set_tbl_cols(-1)       # every pl.DataFrame: show ALL rows and columns,
+pl.Config.set_fmt_str_lengths(1000); pl.Config.set_tbl_width_chars(10_000)   # never truncate strings or by width
 from boba.features import base
 import boba.features.price_dislocation                      # registers the feature
 from boba.research.screening import (build_context, parity_check, build_family,

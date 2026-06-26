@@ -15,6 +15,7 @@ from boba.research.screening import RawEventStream, ScreeningContext, _ffill
 from boba.research.selection import (
     fixed_move_targets,
     ic_grid,
+    ic_scan,
     per_exchange_vs_single,
     second_span_adds,
 )
@@ -31,7 +32,7 @@ def _empty_ctx(**over) -> ScreeningContext:
         tick_at_anchor=np.empty(0), sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0),
         price_target=np.empty(0), rate_target=np.empty(0), base=[], vol_level=np.empty(0),
         rate_level=np.empty(0), vol_regime=np.empty(0),
-        raw_events=RawEventStream(*([np.empty(0)] * 6), ()),
+        raw_events=RawEventStream(*([np.empty(0)] * 8), ()),
     )
     kw.update(over)
     return ScreeningContext(**kw)
@@ -111,7 +112,7 @@ def test_fixed_move_targets_default_counts():
     ctx = _empty_ctx(anchor_ts=anchor_ts, sigma_at_anchor=np.full(len(anchor_ts), 1e-4),
                      _mids={"byb": (rx, mid)}, _mv_rx=rx[moves])
     got = fixed_move_targets(ctx)
-    assert set(got) == {1, 3, 6, 9}                      # default counts
+    assert set(got) == {1, 5, 10, 15, 20, 25, 30}        # default counts
 
 
 # --------------------------------------------------------------------------------------------------
@@ -167,6 +168,44 @@ def test_ic_grid_parallel_matches_sequential():
         assert set(seq) == set(par)
         for src in seq:
             np.testing.assert_array_equal(seq[src], par[src])   # NaNs compared equal by position
+
+
+def _scan_family(spans, leg_of):
+    """Build `{N -> {source -> vec}}` for a single-span (1-D param) feature via `leg_of(src, N)`."""
+    return {N: {s: leg_of(s, N) for s in ("aaa", "bbb")} for N in spans}
+
+
+def test_ic_scan_picks_planted_span():
+    rng = np.random.default_rng(30)
+    n = 8000
+    target = rng.standard_normal(n)
+    spans, best = (1, 10, 50, 200), 50
+
+    def leg_of(src, N):
+        return (target * 0.6 + rng.standard_normal(n)) if N == best else (rng.standard_normal(n) + target * 0.05)
+
+    scan = ic_scan(_empty_ctx(), _scan_family(spans, leg_of), target)
+    assert set(scan) == {"aaa", "bbb"}
+    for src, arr in scan.items():
+        assert arr.shape == (len(spans),)
+        assert sorted(spans)[int(np.nanargmax(arr))] == best
+
+
+def test_ic_scan_mirror_matches_manual_and_magnitude_noop():
+    import boba.research.gates as _g
+    rng = np.random.default_rng(31)
+    n = 8000
+    target = rng.standard_normal(n)
+    spans = (1, 10, 100)
+    fam = _scan_family(spans, lambda s, N: rng.standard_normal(n) + 0.1 * target)
+    scan = ic_scan(_empty_ctx(), fam, target, mirror=np.negative)
+    vec = fam[10]["aaa"]
+    manual = _g.ic(np.concatenate([vec, -vec]), np.concatenate([target, -target]))
+    assert scan["aaa"][sorted(spans).index(10)] == pytest.approx(manual, abs=1e-12)
+    a = ic_scan(_empty_ctx(), fam, target, magnitude=True, mirror=np.negative)
+    b = ic_scan(_empty_ctx(), fam, target, magnitude=True)
+    for src in a:
+        np.testing.assert_array_equal(a[src], b[src])   # |·| is sign-blind: mirror is a no-op
 
 
 def test_ic_grid_magnitude_scores_abs():
@@ -335,10 +374,10 @@ def test_real_block_fixed_move_and_second_span():
 
     # fixed-move targets are finite and ordered (a farther move -> a larger typical |return|)
     fmt = fixed_move_targets(ctx)
-    assert set(fmt) == {1, 3, 6, 9}
+    assert set(fmt) == {1, 5, 10, 15, 20, 25, 30}
     for n, col in fmt.items():
         assert np.isfinite(col).sum() > 1000
-    assert np.nanmean(np.abs(fmt[1])) < np.nanmean(np.abs(fmt[9]))
+    assert np.nanmean(np.abs(fmt[1])) < np.nanmean(np.abs(fmt[30]))
 
     # second_span_adds runs end-to-end on the real family at the documented price pick
     family = build_family(ctx, spec.vectorized, GRID, n_jobs=8)
@@ -452,6 +491,8 @@ def test_every_registered_feature_declares_mirror():
     # The mirror augmentation is a required invariant: every feature must DEFINE its reflection.
     from boba.features import base
     import boba.features.price_dislocation  # noqa: F401  (registers)
+    import boba.features.ofi_fast_slow       # noqa: F401  (registers)
+    import boba.features.ofi_ema             # noqa: F401  (registers)
 
     for spec in base.all_specs():
         assert spec.mirror is not None, f"feature {spec.name!r} has no mirror augmentation defined"

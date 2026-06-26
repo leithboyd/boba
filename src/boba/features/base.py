@@ -29,13 +29,36 @@ extracted from `notebooks/features_v2`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
 
 # A feature-family member is identified by an OPAQUE params token. Examples: a plain EMA -> `N`
 # (int); a fast/slow EMA -> `(n_fast, n_slow)` (tuple). Engines treat it only as a hashable key.
 Params = Any
+
+
+# --------------------------------------------------------------------------------------------------
+# Raw events fed to a streaming feature. ONE record per event carries EVERY property the raw stream
+# holds, so `on_book` / `on_trade` take a single `ev` and their signature never changes when a new
+# feature needs another field — add the field here (and to the raw stream) instead. A feature reads
+# only the props it uses (`ev.bid`, `ev.ask_qty`, `ev.px`, …); the rest cost nothing.
+# --------------------------------------------------------------------------------------------------
+class BookEvent(NamedTuple):
+    listing: str
+    exch_time: int
+    bid: float
+    ask: float
+    bid_qty: float
+    ask_qty: float
+
+
+class TradeEvent(NamedTuple):
+    listing: str
+    exch_time: int
+    px: float
+    lifts_ask: float
+    qty: float
 
 
 @runtime_checkable
@@ -54,7 +77,9 @@ class StreamingFeature(Protocol):
       fuse_trades   -- the listings whose mid folds in trades (merged-levels); the rest are
                        book-only. The driver uses this only to know the feature exists; the class
                        applies the policy itself in on_book/on_trade.
-      on_book/on_trade -- mutate internal state for ONE raw event. Do NOT advance the clock or read.
+      on_book/on_trade -- mutate internal state for ONE raw event, given the full event record
+                       (`BookEvent` / `TradeEvent`). Read only the props you need. Do NOT advance the
+                       clock or read.
       refresh()     -- called ONCE per receive-timestamp, after all that timestamp's events are
                        applied: update live fronts / inject flows, then advance the trade clock AT
                        MOST ONCE (iff a trade landed this timestamp). Same-timestamp events are one
@@ -66,8 +91,8 @@ class StreamingFeature(Protocol):
     keys: tuple[str, ...]
     fuse_trades: frozenset[str]
 
-    def on_book(self, listing: str, exch_time: int, bid: float, ask: float) -> None: ...
-    def on_trade(self, listing: str, exch_time: int, px: float, lifts_ask: bool) -> None: ...
+    def on_book(self, ev: BookEvent) -> None: ...
+    def on_trade(self, ev: TradeEvent) -> None: ...
     def refresh(self) -> None: ...
     def value(self) -> dict[str, float]: ...
 
