@@ -495,6 +495,7 @@ def test_every_registered_feature_declares_mirror():
     import boba.features.price_dislocation  # noqa: F401  (registers)
     import boba.features.ofi_fast_slow       # noqa: F401  (registers)
     import boba.features.ofi_ema             # noqa: F401  (registers)
+    import boba.features.stoikov_premium_fast_slow  # noqa: F401  (registers)
 
     for spec in base.all_specs():
         assert spec.mirror is not None, f"feature {spec.name!r} has no mirror augmentation defined"
@@ -507,7 +508,9 @@ def test_features_declare_param_kind():
     import boba.features.price_dislocation  # noqa: F401
     import boba.features.ofi_fast_slow       # noqa: F401
     import boba.features.ofi_ema             # noqa: F401
+    import boba.features.stoikov_premium_fast_slow  # noqa: F401
 
     assert base.get("price_dislocation").param_kind is ParamKind.FAST_SLOW
     assert base.get("ofi_fast_slow").param_kind is ParamKind.FAST_SLOW
     assert base.get("ofi_ema").param_kind is ParamKind.SINGLE
+    assert base.get("stoikov_premium_fast_slow").param_kind is ParamKind.FAST_SLOW
