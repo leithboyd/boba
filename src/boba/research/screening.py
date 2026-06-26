@@ -142,6 +142,7 @@ class ScreeningContext:
     # --- building blocks a feature derives its inputs from (kept here so build_context loads once) ---
     _mids: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict, repr=False)
     _books: dict[str, tuple] = field(default_factory=dict, repr=False)  # raw front_levels per ex: (rx, bid, bid_qty, ask, ask_qty)
+    _trades: dict[str, tuple] = field(default_factory=dict, repr=False)  # raw trades per ex: (rx, px, lifts_ask, qty)
     target_logmid_on_clock: np.ndarray = field(default=None, repr=False)  # log target mid at each tick
     _mv_rx: np.ndarray = field(default=None, repr=False)                  # target move timestamps
     _mv_r2: np.ndarray = field(default=None, repr=False)                  # squared target moves
@@ -265,6 +266,20 @@ def build_context(
     # books a feature consumes (drop exchange_time, which only the raw-event stream below needs)
     books = {e: (rx, bid, bq, ask, aq) for e, (rx, _et, bid, bq, ask, aq) in books_raw.items()}
 
+    def load_trade_flow(ex):                             # full raw trades WITH side — for trade-flow features.
+        td = (load_block(block, f"{ex}_{coin}", "trade")
+              .select("rx_time", "prc", "qty", "aggressor")
+              .filter((pl.col("prc") > 0) & (pl.col("qty") > 0)))
+        rx = td["rx_time"].cast(pl.Int64).to_numpy()
+        out = (rx, td["prc"].to_numpy(),
+               io._trade_lifts_ask(f"{ex}_{coin}", td["aggressor"].to_numpy()).astype(float),
+               td["qty"].to_numpy())
+        if hours is not None:
+            return tuple(col[rx <= cutoff] for col in out)
+        return out
+
+    trades = {ex: load_trade_flow(ex) for ex in all_ex}
+
     merged_ts = np.unique(np.concatenate(trade_ts))
     n_ticks = len(merged_ts)
     event_ts = np.unique(np.concatenate([mids[e][0] for e in all_ex] + trade_ts))   # book + trade, any venue
@@ -288,7 +303,7 @@ def build_context(
         merged_ts=merged_ts, anchor_ts=np.empty(0), tick_at_anchor=np.empty(0),
         sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0), price_target=np.empty(0), rate_target=np.empty(0),
         base=[], vol_level=np.empty(0), rate_level=np.empty(0), vol_regime=np.empty(0),
-        raw_events=RawEventStream(*([np.empty(0)] * 8), ()), _mids=mids, _books=books,
+        raw_events=RawEventStream(*([np.empty(0)] * 8), ()), _mids=mids, _books=books, _trades=trades,
         target_logmid_on_clock=log_mid_target, _mv_rx=mv_rx, _mv_r2=mv_r2, _clock_dt=clock_dt,
     )
 
