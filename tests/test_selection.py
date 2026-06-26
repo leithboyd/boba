@@ -496,6 +496,9 @@ def test_every_registered_feature_declares_mirror():
     import boba.features.ofi_fast_slow       # noqa: F401  (registers)
     import boba.features.ofi_ema             # noqa: F401  (registers)
     import boba.features.stoikov_premium_fast_slow  # noqa: F401  (registers)
+    import boba.features.trade_flow_imbalance  # noqa: F401  (registers)
+    import boba.features.price_momentum      # noqa: F401  (registers)
+    import boba.features.flow_persistence    # noqa: F401  (registers)
 
     for spec in base.all_specs():
         assert spec.mirror is not None, f"feature {spec.name!r} has no mirror augmentation defined"
@@ -509,8 +512,14 @@ def test_features_declare_param_kind():
     import boba.features.ofi_fast_slow       # noqa: F401
     import boba.features.ofi_ema             # noqa: F401
     import boba.features.stoikov_premium_fast_slow  # noqa: F401
+    import boba.features.trade_flow_imbalance  # noqa: F401
+    import boba.features.price_momentum      # noqa: F401
+    import boba.features.flow_persistence    # noqa: F401
 
     assert base.get("price_dislocation").param_kind is ParamKind.FAST_SLOW
     assert base.get("ofi_fast_slow").param_kind is ParamKind.FAST_SLOW
     assert base.get("ofi_ema").param_kind is ParamKind.SINGLE
     assert base.get("stoikov_premium_fast_slow").param_kind is ParamKind.FAST_SLOW
+    assert base.get("trade_flow_imbalance").param_kind is ParamKind.SINGLE
+    assert base.get("price_momentum").param_kind is ParamKind.SINGLE
+    assert base.get("flow_persistence").param_kind is ParamKind.SINGLE
