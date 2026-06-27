@@ -14,7 +14,7 @@ from boba.dataset_v2.engine import (
 )
 from boba.dataset_v2.driver import build_dataset_v2, tail_window_ns_for
 
-from tests.test_dataset_v2_engine import _blocks, _cfg, _continuous, LISTINGS
+from tests.dataset_v2.test_engine import _blocks, _cfg, _continuous, LISTINGS
 
 
 def _gcfg(**kw):

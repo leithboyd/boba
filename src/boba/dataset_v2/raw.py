@@ -1525,7 +1525,7 @@ def build_features_raw(
     # on the grid); the mid path is full-resolution, so a clock trade just bundles the squared
     # 1ms mid-returns since the previous clock trade into one EMA step. With a foreign @{CLOCK},
     # every listing decays per the SAME trades, so a busy and a quiet venue's vol line up. This
-    # is the exact vectorisation of the oracle in tests/test_dataset_v2_volclock.py:
+    # is the exact vectorisation of the oracle in tests/dataset_v2/test_volclock.py:
     #   cs = cumsum(sq mid-returns); V_k = cs[clockpos_k] − cs[clockpos_{k-1}]; y = ewm(V); vol = √y.
     vol_units = [u for u in exp.units if u.family == "vol_t"]
     if vol_units:

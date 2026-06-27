@@ -1,6 +1,6 @@
 """Walk-forward feature-screening gates — shared, tested, used by every feature notebook.
 
-Pulled out of the per-feature builders so the gate machinery lives (and is TESTED in tests/test_gates*.py)
+Pulled out of the per-feature builders so the gate machinery lives (and is TESTED in tests/research/test_gates*.py)
 in ONE place instead of being copy-pasted into ~23 builders. This is research/analysis tooling, not part
 of the production ETL path.
 
@@ -28,7 +28,7 @@ EXTERNALLY VALIDATED (nothing reinvented — see tests + the verification notes)
     we track; they do NOT prove full distributional independence and can miss TAIL/quantile shifts.
   * sigma/lambda normalisation — volatility scaling + event-time (count) subordination (Clark 1973; Ane & Geman 2000).
 
-CORRECTNESS NOTES (each was a bug found the hard way; tests/test_gates_bug_regressions.py pins them red->green):
+CORRECTNESS NOTES (each was a bug found the hard way; tests/research/test_gates_bug_regressions.py pins them red->green):
   * Tie handling. The screening target `fwd_return/sigma_ev` is mostly EXACT ZEROS (~95% — byb's mid rarely
     moves over a 100ms window). Spearman MUST use average-rank ties (`spearmanr`/`rankdata(method="average")`);
     ordinal (argsort) ranking spreads the tied zeros across distinct ranks by time-position, manufacturing a

@@ -21,6 +21,7 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 - **Don't trust a correlation** until it survives the regime controls (rate and vol momenta) — else it may just be re-reporting "the market is volatile."
 - **Don't ship a feature without the parity check** — the streaming build must reproduce the vectorized build on real data (`parity_check`).
 - **Don't hand-roll a streaming EMA, and don't use `EventEMA`** — use only `KernelMeanEMA` (flow) or `LiveFrontEMA` (level) from `boba.ema`, and no `lfilter` in the streaming build. (See [EMA construction](#ema-construction) for the full rule and the why.)
+- **Don't leave `span = 1` ill-defined.** `span = 1` (α = 1, no smoothing) is a *distinct code path* and the most-used fast leg — never let it slip into a `0/0`, an `inf`, or a value that differs online vs offline. A genuinely-undefined state (warm-up / no relevant event yet) must be a **consistent NaN both builds agree on** (the gates mask it) — never a spurious `inf` or a build-specific number; everywhere the inputs exist the value must be **finite**.
 - **Don't peek ahead.** Every value uses only data at-or-before its own timestamp (a stray forward-fill is the usual way to break this).
 - **Don't over-transform for the network.** Pick the lightest reshaping that works.
 - **Don't fuse the two gates.** Regime invariance (Gate A — the feature's own distribution being stable across regimes) and signal (Gate B — what it predicts over the *invariant* controls) are independent tests. The raw vol/rate **levels** are never Gate-B controls (they aren't valid features) — they are only the Gate-A regime *coordinate*. And a control can itself be a valid feature: when the feature *is* a regime descriptor, judge it on standalone signal, never "redundant" from its algebra alone.
@@ -28,6 +29,7 @@ Hard rules, learned the hard way. Follow them unless you have a specific, writte
 **Do**
 - **Do start with a falsifiable hypothesis** — a mechanism for why it should work, and what would prove it wrong.
 - **Do build every average by the EMA contract** — which class and when to inject vs decay are specified in [EMA construction](#ema-construction) below; the parity check enforces it.
+- **Do define and test the feature at `span = 1`.** Choose its value at the no-smoothing boundary deliberately — a level's live front collapses to the freshest read, a flow's `E/W` to the latest sample — and guard the degenerate arithmetic (`0/0`, `inf`) on **both** sides. Include a `span = 1` leg in the parity check (and an oracle row that asserts finiteness wherever inputs exist): it is the leg most likely to expose an α=1 online/offline mismatch, and the one the analysis sweeps most.
 - **Do test against both heads — but feed both the *signed* feature.** Check whether the signed feature predicts *direction* (price head) and whether its *magnitude* predicts *intensity* (rate head). Those are diagnostics — the model is fed the **signed** feature to *both* heads, never a pre-computed `|feature|` (which would destroy the sign and the cancel/reinforce interaction the rate head learns).
 - **Do score out-of-sample** with a purged, embargoed walk-forward (strictly past→future), the embargo sized to clear the outcome window — *because* overlapping forward labels let a train row's outcome window straddle the train/test boundary and leak the future, inflating the OOS IC. A single split is only a faster screen.
 - **Do use the freshest valid price per source** — read the trade-fused `merged_levels` mid where the venue benefits; see [Price source](#price-source--fresh-mids-vs-raw-sizes).
@@ -81,7 +83,7 @@ mirror(feature(books))  ==  feature(mirror_books(books))
 
 — applying the declared `mirror` to the feature computed on the real books equals recomputing the feature on the **mirror-reflected** books (`mirror_books` = reflect every price through a fixed level per the table above; sizes/clock unchanged). If they disagree, the declared `mirror` is wrong (or the feature has a hidden even/odd-breaking term) and the mirror-augmented IC is meaningless.
 
-**Every feature MUST (a) declare `FeatureSpec.mirror` (never leave it `None`) and (b) ship a test of this commutation invariant** — reflect a synthetic block's books, rebuild, and assert equality to float round-off. See `tests/test_selection.py::test_price_dislocation_mirror_commutes_with_book_reflection` for the pattern (and `test_every_registered_feature_declares_mirror`, which fails any feature that omits the declaration). This is non-negotiable, exactly like the parity check.
+**Every feature MUST (a) declare `FeatureSpec.mirror` (never leave it `None`) and (b) ship a test of this commutation invariant** — reflect a synthetic block's books, rebuild, and assert equality to float round-off. See `tests/features/test_price_dislocation.py::test_mirror_commutes_with_full_book_reflection` for the pattern (and `test_every_registered_feature_declares_mirror`, which fails any feature that omits the declaration). This is non-negotiable, exactly like the parity check.
 
 ### What the engines do, and what it buys
 
@@ -114,7 +116,7 @@ Classify the quantity, then pick the class — mis-classifying produces a wrong 
 - **A level** — defined at *every* instant (a price, a cross-source gap, a microprice): use **`LiveFrontEMA`**, read as the live front `(1 − α)·committed + α·latest` — current between trades, never frozen on the last trade. *Why no `W`:* a level has a value at every tick, so there are no missing events to normalise away; what it needs is to stay fresh between trades, which the live front gives.
 - **Banned:** `EventEMA` directly; any hand-rolled scalar EMA (no `_ScalarEMA`, no `(1−α)·s + α·x` per-event loop); `scipy.signal.lfilter` **in the streaming build**. (The *vectorized* offline builder may use `lfilter` — it is not the production path.)
 - Anything not cleanly a flow or a level is mis-modelled. A slope / covariance is a **ratio of flow EMAs** (several `KernelMeanEMA`s), not a bespoke class.
-- All EMAs use `α = 2/(span + 1)`. `span = 1` ⇒ `α = 1` (no memory / no smoothing) — a distinct code path on both sides and the most-used fast leg; handle it deliberately.
+- All EMAs use `α = 2/(span + 1)`. `span = 1` ⇒ `α = 1` (no memory / no smoothing) — a distinct code path on both sides and the most-used fast leg; handle it deliberately and keep it **well-defined**: finite and identical online vs offline, with any degenerate `E/W` / `0/0` resolving to a *consistent* NaN (the gates mask it), never `inf` or a build-specific number (see the `span = 1` Do/Don't in the guard rails).
 
 ### When to inject vs decay
 

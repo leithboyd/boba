@@ -1,12 +1,20 @@
 """`ofi_fast_slow` — the path-sum level-1 Order-Flow Imbalance, as a fast/slow oscillator.
 
-Each time byb's top-of-book changes, the **OFI increment** (Cont–Kukanov–Stoikov) counts the net depth
-added on the bid minus the ask: positive = net buying pressure. The **path-sum** variant injects, per
-receive-timestamp, the SUM of the per-raw-row increments (the full intra-ns book path) as ONE flow
-sample. We smooth that flow two ways — a fast and a slow `KernelMeanEMA` leg, each read as `E/W` (a
-sparse flow per AUTHORING) — and take `fast − slow`: a sign-stable lean-vs-baseline oscillator. It
-**fans out over every exchange** — one leg per venue, each built from that venue's OWN book (byb's own
-order flow, plus each foreign venue's as a cross-venue lead); `params = (n_fast, n_slow)`.
+WHAT it measures. Each time byb's top-of-book changes, the **OFI increment** (Cont–Kukanov–Stoikov)
+counts the net depth added on the bid minus the ask: positive = net buying pressure. The **path-sum**
+variant injects, per receive-timestamp, the SUM of the per-raw-row increments (the full intra-ns book
+path) as ONE flow sample. We smooth that flow two ways — a fast and a slow `KernelMeanEMA` leg, each
+read as `E/W` (a sparse flow per AUTHORING) — and take `fast − slow`: a sign-stable lean-vs-baseline
+oscillator. It **fans out over every exchange** — one leg per venue, each built from that venue's OWN
+book (byb's own order flow, plus each foreign venue's as a cross-venue lead); `params = (n_fast, n_slow)`.
+
+WHY it might predict (falsifiable hypothesis). The L1 OFI increment counts net depth added to the bid
+minus the ask, so its sign is the direction the book is being pushed. A *fresh* fast-minus-slow lean —
+recent order flow leaning harder than its own slower baseline — should anticipate byb's next move in that
+direction (positive lean → up). Falsified if the feature shows no forward signed information coefficient.
+
+RESEARCH. Cont, R., Kukanov, A. & Stoikov, S. (2014) 'The Price Impact of Order Book Events', Journal
+of Financial Econometrics 12(1):47-88.
 
 Two implementations of the same maths, tied by `boba.research.screening.parity_check`:
   - `vectorized(ctx, params)` -> {exchange -> feature vector on the grid}   (offline; reuses `ctx._flow_at`)

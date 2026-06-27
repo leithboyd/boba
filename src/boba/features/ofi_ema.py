@@ -12,6 +12,18 @@ Two implementations of the same maths, tied by `boba.research.screening.parity_c
 Mirror augmentation: OFI is signed order flow, ODD under the reflection of the tape through byb's mid
 (the bid/ask sides swap, so the increment negates). So `SPEC.mirror` is `np.negative`.
 
+WHY it might predict (falsifiable): the path-sum L1 OFI flow measures net depth *added* on the bid minus
+that added on the ask — pressure from limit-order arrivals/cancellations at the top of book. The
+hypothesis is that this signed pressure leads byb's next mid-move in the same direction: a positive EMA
+(more bid-side than ask-side depth accruing) precedes an up-move, a negative one a down-move. A single
+EMA span carries it; `N = 1` (α = 1) is the freshest, unsmoothed read and the leg the sweep leans on
+hardest. It is FALSIFIED if the EMA shows no forward signed information coefficient against byb's
+mid-move at any span (a flat, sign-indifferent IC) — order-book imbalance then carries no directional edge.
+
+Research: Cont, R., Kukanov, A. & Stoikov, S. (2014) 'The Price Impact of Order Book Events', Journal of
+Financial Econometrics 12(1):47-88 — the order-flow-imbalance increment summed here is theirs, and they
+document its (contemporaneous, here-tested-forward) linear relation to price moves.
+
 See `AUTHORING.md` (this directory) for the EMA-type and inject/decay rules these obey.
 """
 from __future__ import annotations

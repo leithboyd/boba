@@ -218,7 +218,7 @@ md(r"""
 ## 4. Ship checklist
 
 - [ ] the streaming (constant-work-per-event) builder, matching the analysis — parity-checked in screening
-- [ ] the tests, passing — the feature's parity/oracle/mirror tests + `tests/test_selection.py`, `tests/test_shaping.py`
+- [ ] the tests, passing — the feature's parity/oracle/mirror tests + `tests/research/test_selection.py`, `tests/research/test_shaping.py`
 - [ ] the gate results recorded (with any failures justified) — screening verdict
 - [ ] the chosen heads and time-scales written down, with the yardstick spans (`YARDSTICK_N`)
 - [ ] the data quirks handled (the right price source per exchange) — in `build_context`

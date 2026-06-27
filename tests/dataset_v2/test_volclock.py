@@ -231,7 +231,7 @@ class TestLibraryVsOracle:
         # MANUAL calc on the raw arrays (vol_ref, the PoC logic) must equal the dataset's column,
         # for own-clock AND foreign-clock vol, at several N.
         from boba.dataset_v2 import col
-        from tests.test_dataset_v2_engine import _synth_block            # real BBO+trade SessionData
+        from tests.dataset_v2.test_engine import _synth_block            # real BBO+trade SessionData
         sd = _synth_block(0, 4000 * MS, seed=7)
         out = _build(sd, (
             col("{LISTING}_vol_{N}t", LISTING=["bin"], N=[10, 50]),                    # own clock
@@ -266,7 +266,7 @@ class TestLibraryVsOracle:
         # explicitly clocked off ITSELF (@self) — the @{CLOCK} default and the explicit own clock
         # are the same thing.
         from boba.dataset_v2 import col
-        from tests.test_dataset_v2_engine import _synth_block
+        from tests.dataset_v2.test_engine import _synth_block
         sd = _synth_block(0, 4000 * MS, seed=7)
         out = _build(sd, (
             col("{LISTING}_vol_{N}t", LISTING=["bin"], N=[10, 50]),                       # bare → own clock
@@ -313,7 +313,7 @@ class TestLibraryVsOracle:
         from boba.dataset_v2.engine import Block, build_chunked, concat_sessions
         from boba.dataset_v2.cache import read_blocks
         from boba.dataset_v2.driver import tail_window_ns_for
-        from tests.test_dataset_v2_engine import _synth_block, LISTINGS, TARGET, SPAN_MS
+        from tests.dataset_v2.test_engine import _synth_block, LISTINGS, TARGET, SPAN_MS
         blocks = [Block(f"b{i}", i * SPAN_MS, (i + 1) * SPAN_MS,
                         _synth_block(i * SPAN_MS * MS, (i + 1) * SPAN_MS * MS, seed=i)) for i in range(3)]
         cfg = DatasetRawConfig(
@@ -469,7 +469,7 @@ class TestBookEventClock:
         # AND on a FOREIGN clock (byb's quantity over bin's trades). The wiring gate for the whole
         # set: level/flow, _sq, centered microprice, own + cross-exchange clock.
         from boba.dataset_v2 import col
-        from tests.test_dataset_v2_engine import _synth_block
+        from tests.dataset_v2.test_engine import _synth_block
         sd = _synth_block(0, 4000 * MS, seed=7)
         ref_mp = {"bin": 100.0, "byb": 100.0}
         N = 15
@@ -496,7 +496,7 @@ class TestBookEventClock:
 
     def test_level_matches_raw_oracle(self):              # book_imbalance = LEVEL (sample at trades)
         from boba.dataset_v2 import col
-        from tests.test_dataset_v2_engine import _synth_block
+        from tests.dataset_v2.test_engine import _synth_block
         sd = _synth_block(0, 4000 * MS, seed=7)
         out = _build(sd, (
             col("{LISTING}_ema_book_imbalance_{N}t", LISTING=["bin"], N=[10, 50]),
@@ -513,7 +513,7 @@ class TestBookEventClock:
 
     def test_flow_matches_raw_oracle(self):              # ofi = FLOW (sum per clock interval)
         from boba.dataset_v2 import col
-        from tests.test_dataset_v2_engine import _synth_block
+        from tests.dataset_v2.test_engine import _synth_block
         sd = _synth_block(0, 4000 * MS, seed=7)
         out = _build(sd, (
             col("{LISTING}_ema_ofi_{N}t", LISTING=["bin"], N=[10, 50]),
@@ -530,7 +530,7 @@ class TestBookEventClock:
 
     def test_own_clock_equals_no_clock(self):
         from boba.dataset_v2 import col
-        from tests.test_dataset_v2_engine import _synth_block
+        from tests.dataset_v2.test_engine import _synth_block
         sd = _synth_block(0, 4000 * MS, seed=7)
         out = _build(sd, (
             col("{LISTING}_ema_book_imbalance_{N}t", LISTING=["bin"], N=[20]),
@@ -566,7 +566,7 @@ class TestBookEventClock:
         from boba.dataset_v2.engine import Block, build_chunked, concat_sessions
         from boba.dataset_v2.cache import read_blocks
         from boba.dataset_v2.driver import tail_window_ns_for
-        from tests.test_dataset_v2_engine import _synth_block, LISTINGS, TARGET, SPAN_MS
+        from tests.dataset_v2.test_engine import _synth_block, LISTINGS, TARGET, SPAN_MS
         blocks = [Block(f"b{i}", i * SPAN_MS, (i + 1) * SPAN_MS,
                         _synth_block(i * SPAN_MS * MS, (i + 1) * SPAN_MS * MS, seed=i)) for i in range(3)]
         cfg = DatasetRawConfig(
@@ -611,7 +611,7 @@ class TestTradeFlowClock:
         # the bare own-clock column is produced by the OLD Section-3 path; @trades_self goes through
         # the new clock path. They must be byte-identical (one trade per own-clock interval).
         from boba.dataset_v2 import col
-        from tests.test_dataset_v2_engine import _synth_block
+        from tests.dataset_v2.test_engine import _synth_block
         sd = _synth_block(0, 4000 * MS, seed=7)
         cols = []
         for f in _TRADE_FLOW:

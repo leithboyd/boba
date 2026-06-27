@@ -1,14 +1,23 @@
-"""`stoikov_premium_fast_slow` -- Stoikov micro-price premium, as a fast/slow oscillator.
+"""`stoikov_premium_fast_slow` -- size-weighted-mid premium, as a fast/slow oscillator.
 
 Each venue's L1 book gives a size-weighted fair value between the quotes:
 
     microprice = (bid_qty * ask_prc + ask_qty * bid_prc) / (bid_qty + ask_qty)
     prem       = (microprice - mid) / mid
 
+This `microprice` is the SIZE-WEIGHTED (imbalance-adjusted) MID -- the *leading / first-order term*
+of Stoikov's micro-price, NOT the full martingale micro-price estimator. Stoikov's estimator adds a
+mean-reverting correction fitted from the imbalance->future-mid dynamics; here we keep only the
+leading size-weighted-mid term, which is exact at L1 from `(bid, bid_qty, ask, ask_qty)` and needs no
+fit. (Name kept for continuity; read "stoikov premium" as "size-weighted-mid premium".)
+
 A positive premium means the touch leans up: bid size is large relative to ask size, pulling the
 fair value toward the ask. This feature smooths that LEVEL two ways with `LiveFrontEMA` and returns
 `fast - slow`. It fans out over every exchange -- the target plus each foreign source -- using each
 venue's OWN raw `front_levels` book because the sizes are required; `params = (n_fast, n_slow)`.
+
+Reference: Stoikov, S. (2018) 'The Micro-Price: A High-Frequency Estimator of Future Prices',
+Quantitative Finance 18(12):1959-1966 (SSRN 2970694); Gatheral, J. & Oomen, R. (size-weighted mid).
 
 Two implementations of the same maths, tied by `boba.research.screening.parity_check`:
   - `vectorized(ctx, params)` -> {exchange -> feature vector on the grid}   (offline; may use lfilter)

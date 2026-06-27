@@ -10,7 +10,7 @@ This project uses [pixi](https://pixi.sh) for environment and dependency managem
 
 - `pixi install` — create/update the environment
 - `pixi run test` — run the test suite (pytest)
-- `pixi run pytest tests/test_dataset_raw.py::TestAlpha -q` — run a single test class/test
+- `pixi run pytest tests/dataset/test_raw.py::TestAlpha -q` — run a single test class/test
 - `pixi add <package>` — add a conda-forge dependency
 - `pixi run python ...` — run anything inside the environment
 
@@ -95,7 +95,7 @@ simple code**. To keep the oracle a genuine check and not a copy of the same bug
 - Production (parallel, chunked, cached) output must match the oracle to float32 tolerance
   on the real block.
 
-See `tests/test_dataset_v2_volclock.py` for the pattern: `vol_ref` / `level_ema_ref` /
+See `tests/dataset_v2/test_volclock.py` for the pattern: `vol_ref` / `level_ema_ref` /
 `flow_ema_ref` are the blind oracles; `TestRealBlock` runs the diff on a real ETH-perp block
 (skipped when `DATA_DIR` is unset). Any new column lands with the same trio: oracle +
 synthetic property tests + a real-block diff.

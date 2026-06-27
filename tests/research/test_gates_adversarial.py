@@ -1,6 +1,6 @@
 """Adversarial / mutation-style suite for boba.research.gates.
 
-This complements tests/test_gates.py. Its job is to find FALSE CONFIDENCE: assertions that would pass
+This complements tests/research/test_gates.py. Its job is to find FALSE CONFIDENCE: assertions that would pass
 even if the gate machinery were wrong. For every key safeguard we keep a *local broken copy* of the
 relevant computation (we never touch gates.py) and assert the BROKEN variant gives the wrong answer
 while the SHIPPED gate gives the right one — i.e. the safeguard has teeth.

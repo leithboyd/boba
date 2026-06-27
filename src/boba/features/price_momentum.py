@@ -1,12 +1,24 @@
 """`price_momentum` -- per-venue EMA of log-mid moves in target volatility units.
 
-For each venue, collapse same-timestamp mid rows to the final state, take non-zero `Δlog(mid)` moves,
-and smooth them as a sparse flow with `KernelMeanEMA` on the shared trade clock. The feature is:
+WHAT it measures. For each venue, collapse same-timestamp mid rows to the final state, take non-zero
+`Δlog(mid)` moves, and smooth them as a sparse flow with `KernelMeanEMA` on the shared trade clock.
+The feature is:
 
     EMA(Δlog mid) / σ_ev
 
 where `σ_ev` is the target volatility yardstick from `ScreeningContext` / `LiveYardstick`. It fans
 out over every exchange -- the target plus each foreign source; `params = N` (the EMA span).
+
+WHY it might predict (a falsifiable hypothesis). Recent log-mid moves tend to *continue* at short
+microstructure horizons (momentum / trend), rather than immediately reverting. So a positive EMA of
+a venue's recent moves -- read in `σ_ev` units, so the strength is measured against the target's own
+volatility -- predicts byb's mid continuing *up* (and a negative EMA, down). The hypothesis is
+falsified if there is no forward signed IC, or if the relationship is the wrong sign (the moves
+mean-revert rather than persist).
+
+Research. Moskowitz, T., Ooi, Y.H. & Pedersen, L.H. (2012) 'Time Series Momentum', Journal of
+Financial Economics 104(2):228-250 -- an EWMA-of-returns trend signal that predicts the same
+instrument's own future returns, the direct macro-horizon analogue of this microstructure EMA.
 
 Mirror augmentation: log returns negate under price reflection while `σ_ev` is even, so the feature
 is ODD and `SPEC.mirror` is `np.negative`.

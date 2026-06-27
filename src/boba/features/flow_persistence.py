@@ -1,6 +1,6 @@
 """`flow_persistence` -- EMA of consecutive per-timestamp trade-flow sign agreement.
 
-For each venue, trades sharing a receive timestamp are first netted by side count:
+WHAT it measures. For each venue, trades sharing a receive timestamp are first netted by side count:
 
     eps_t = sign(sum(side_i))
 
@@ -8,6 +8,18 @@ Exact ties are skipped. The feature is a sparse-flow `KernelMeanEMA` of `eps_t *
 `eps_prev` is the venue's previous non-zero per-timestamp sign. Positive values mean trade-flow sign
 tends to persist; negative values mean it tends to alternate. It fans out over every exchange -- the
 target plus each foreign source; `params = N` (the EMA span).
+
+WHY it might predict (a falsifiable hypothesis). Trade-flow sign has long memory: large parent orders
+are split into many child slices that print in one direction over time, so a buy is far more likely to
+be followed by another buy than by a sell. When `eps_t * eps_prev > 0` (consecutive signs agree) the
+venue is mid-campaign and the directional pressure is ongoing -- so the move count over the next
+horizon should be elevated. Because the feature measures persistence *magnitude* and is sign-symmetric
+(a buy-campaign and a sell-campaign produce the same product), it is an EVEN feature and belongs to the
+RATE head; its mirror is the identity. Falsified if `|feature|` has no forward power on the move count.
+
+RESEARCH. Bouchaud, J.-P., Gefen, Y., Potters, M. & Wyart, M. (2004) 'Fluctuations and response in
+financial markets: the subtle nature of random price changes', Quantitative Finance 4(2):176-190
+(long-memory / autocorrelation of order-flow sign).
 
 Mirror augmentation: under tape reflection both `eps_t` and `eps_prev` flip sign, so their product is
 EVEN. `SPEC.mirror` is therefore the identity.

@@ -1,8 +1,17 @@
 """`price_dislocation` — the worked-example feature, as a registered `FeatureSpec`.
 
-How far another source's price has drifted from the target's: the log-price gap, smoothed two ways
-(a fast and a slow `LiveFrontEMA` leg) and divided by the volatility yardstick `σ_ev`. One leg per
-foreign source (a fan-out feature). `params = (n_fast, n_slow)`.
+WHAT it measures. How far another source's price has drifted from the target's: the log-price gap,
+smoothed two ways (a fast and a slow `LiveFrontEMA` leg) and divided by the volatility yardstick
+`σ_ev`. One leg per foreign source (a fan-out feature). `params = (n_fast, n_slow)`.
+
+WHY it might predict. Venues discover price at different speeds, so a faster source's mid leads byb:
+a fresh smoothed cross-venue gap is the foreign price having moved before byb has caught up, and it
+should predict byb's catch-up *toward* that foreign price (a signed lead-lag edge). FALSIFIED if the
+gap carries no forward signed IC on byb's mid — i.e. byb does not catch up and the gap is just noise.
+
+RESEARCH. Hasbrouck, J. (1995) 'One Security, Many Markets', Journal of Finance 50(4):1175-1199;
+Hayashi, T. & Yoshida, N. (2005) 'On covariance estimation of non-synchronously observed diffusion
+processes', Bernoulli 11(2):359-379 (cross-venue lead-lag).
 
 Two implementations of the same maths, tied by `boba.research.screening.parity_check`:
   - `vectorized(ctx, params)` -> {source -> feature vector on the grid}   (offline, may use lfilter)
