@@ -57,7 +57,7 @@ if IS_2D:                                                   # fast/slow grid: pa
 else:                                                       # single-span family: params = N
     SPANS = sorted([1, 10, 50, 100, 500, 1000, 2000, 5000, 10000]); GRID = SPANS
 COUNTS = (1, 3, 5)                                         # fixed mid-move-count horizons for the price-head sweep (§1)
-KEYS = spec.keys_for(ctx, GRID[0])                         # the feature's leg keys (per-exchange) — works for any feature
+KEYS = spec.keys_for(ctx.config, GRID[0])                         # the feature's leg keys (per-exchange) — works for any feature
 family = build_family(ctx, spec.vectorized, GRID, n_jobs=18)                  # {params: {leg: vector}}
 print(f"{FEATURE}  ({spec.param_kind.value})   block {ctx.block}   {len(GRID)} spans   legs {KEYS}")
 print(f"{len(ctx.anchor_ts):,} examples (anchors) on the event-gated grid   from {len(ctx.merged_ts):,} trade ticks")

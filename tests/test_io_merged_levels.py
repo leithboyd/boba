@@ -15,7 +15,9 @@ import boba.io as io
 # ── synthetic property tests (no data) ───────────────────────────────────────
 
 def _merge_side_ref(snap_rx, snap_ex, snap_px, tr_rx, tr_ex, tr_px):
-    """Independent reference for io._merge_side: explicit loop, newest-by-exch wins."""
+    """Independent reference for io._merge_side: explicit loop, newest-by-exch wins, and on an
+    exchange_time TIE the LATEST event in sequence wins (`>=`) — so a same-exchange_time sweep
+    resolves to its last/deepest print."""
     ev = sorted(
         [(rx, 0, ex, px) for rx, ex, px in zip(snap_rx, snap_ex, snap_px)]
         + [(rx, 1, ex, px) for rx, ex, px in zip(tr_rx, tr_ex, tr_px)],
@@ -24,7 +26,7 @@ def _merge_side_ref(snap_rx, snap_ex, snap_px, tr_rx, tr_ex, tr_px):
     best_px, best_ex = np.nan, np.iinfo(np.int64).min
     rx_o, px_o, ex_o = [], [], []
     for rx, _kind, ex, px in ev:
-        if ex > best_ex:
+        if ex >= best_ex:                                 # >= : ties resolve to the latest-in-sequence event
             best_px, best_ex = px, ex
         rx_o.append(rx); px_o.append(best_px); ex_o.append(best_ex)
     return np.array(rx_o), np.array(px_o), np.array(ex_o)
@@ -53,14 +55,43 @@ def test_merge_side_newest_exchange_time_wins_not_rx_order():
     assert px[-1] == 11.0                                  # held the fresher snapshot, ignored the stale trade
 
 
+def test_merge_side_same_exchange_time_sweep_holds_latest_print():
+    # one aggressive order printing several trades at ONE exchange_time (a book sweep, arriving in
+    # sequence): the merge must hold the LAST/deepest print, not the first.
+    snap_rx = np.array([0]); snap_ex = np.array([0]); snap_px = np.array([10.0])
+    tr_rx = np.array([10, 11, 12]); tr_ex = np.array([5, 5, 5]); tr_px = np.array([10.1, 10.2, 10.3])
+    rx, px, ex = io._merge_side(snap_rx, snap_ex, snap_px, tr_rx, tr_ex, tr_px)
+    assert px[-1] == 10.3 and ex[-1] == 5                  # deepest sweep print, NOT 10.1 (the first)
+    rrx, rpx, rex = _merge_side_ref(snap_rx, snap_ex, snap_px, tr_rx, tr_ex, tr_px)
+    assert np.array_equal(rx, rrx) and np.allclose(px, rpx) and np.array_equal(ex, rex)
+
+
+def test_uncross_book_trusts_fresher_side_and_pushes_stale_one_tick():
+    # the independently-fused sides can cross; un-cross trusts the side with the newer exchange_time and
+    # pushes the STALE side exactly one tick past it. Four rows: crossed/ask-fresh, not-crossed,
+    # crossed/bid-fresh, locked(ask==bid).
+    tick = 0.01
+    bid    = np.array([100.05, 100.00, 100.20, 100.00])
+    ask    = np.array([100.00, 100.50, 100.10, 100.00])
+    bid_ex = np.array([1,      5,      9,      7])
+    ask_ex = np.array([2,      4,      3,      7])
+    b, a = io._uncross_book(bid, ask, bid_ex, ask_ex, tick)
+    assert b[0] == pytest.approx(99.99) and a[0] == pytest.approx(100.00)   # ask fresher -> bid down a tick
+    assert b[1] == pytest.approx(100.00) and a[1] == pytest.approx(100.50)  # not crossed -> unchanged
+    assert b[2] == pytest.approx(100.20) and a[2] == pytest.approx(100.21)  # bid fresher -> ask up a tick
+    assert b[3] == pytest.approx(100.00) and a[3] == pytest.approx(100.00)  # locked (ask==bid) -> unchanged
+    assert np.all(a >= b)                                                   # every row is uncrossed
+
+
 # ── real-block oracle (skipped without data) ─────────────────────────────────
 
 _HAS_DATA = io.DATA_DIR is not None
 
 
-def _build_ref(fl: pl.DataFrame, td: pl.DataFrame) -> dict:
-    """Dead-simple reference for the full merged stream: stream every event in rx
-    order, newest-by-exch wins per side, keep the final state per distinct rx."""
+def _build_ref(fl: pl.DataFrame, td: pl.DataFrame, tick: float) -> dict:
+    """Dead-simple reference for the full merged stream: stream every event in rx order, newest-by-exch
+    wins per side, keep the final state per distinct rx — then UN-CROSS (where ask < bid, trust the side
+    with the newer exchange_time and push the stale one one `tick` past it; ties -> ask fresher)."""
     s_rx = fl["rx_time"].cast(pl.Int64).to_numpy(); s_ex = fl["exchange_time"].cast(pl.Int64).to_numpy()
     bid = fl["bid_prc"].to_numpy(); ask = fl["ask_prc"].to_numpy()
     t_rx = td["rx_time"].cast(pl.Int64).to_numpy(); t_ex = td["exchange_time"].cast(pl.Int64).to_numpy()
@@ -71,15 +102,19 @@ def _build_ref(fl: pl.DataFrame, td: pl.DataFrame) -> dict:
         key=lambda e: (e[0], e[1]),
     )
     bb = ba = np.nan; bex = aex = np.iinfo(np.int64).min; out = {}
-    for rx, _kind, ex, p1, p2, istr in ev:
+    for rx, _kind, ex, p1, p2, istr in ev:                  # >= : on an exchange_time tie the latest event in sequence wins
         if not istr:
-            if ex > bex: bb, bex = p1, ex
-            if ex > aex: ba, aex = p2, ex
+            if ex >= bex: bb, bex = p1, ex
+            if ex >= aex: ba, aex = p2, ex
         elif p2:                                            # buy -> ask
-            if ex > aex: ba, aex = p1, ex
+            if ex >= aex: ba, aex = p1, ex
         else:                                               # sell -> bid
-            if ex > bex: bb, bex = p1, ex
-        out[rx] = (bb, ba, bex, aex)
+            if ex >= bex: bb, bex = p1, ex
+        b, a = bb, ba
+        if a < b:                                           # un-cross this row
+            if aex >= bex: b = a - tick                     # ask fresher -> clamp bid down a tick
+            else:          a = b + tick                     # bid fresher -> clamp ask up a tick
+        out[rx] = (b, a, bex, aex)
     rx = np.array(sorted(out))
     return dict(rx_time=rx,
                 bid_prc=np.array([out[r][0] for r in rx]), ask_prc=np.array([out[r][1] for r in rx]),
@@ -112,13 +147,16 @@ def test_merged_levels_matches_oracle_on_real_block():
     bid_rx, bid_px, bid_ex = io._merge_side(s_rx, s_ex, bid, t_rx[~buy], t_ex[~buy], t_px[~buy])
     uniq = np.unique(np.concatenate([s_rx, t_rx]))
     ai = np.searchsorted(ask_rx, uniq, "right") - 1; bi = np.searchsorted(bid_rx, uniq, "right") - 1
+    tick = io.tick_size(listing)
+    b_unc, a_unc = io._uncross_book(bid_px[bi], ask_px[ai], bid_ex[bi], ask_ex[ai], tick)   # the production un-cross
 
-    ref = _build_ref(fl, td)
+    ref = _build_ref(fl, td, tick)
     assert np.array_equal(uniq, ref["rx_time"])
-    assert np.array_equal(bid_px[bi], ref["bid_prc"])
-    assert np.array_equal(ask_px[ai], ref["ask_prc"])
-    assert np.array_equal(bid_ex[bi], ref["bid_exchange_time"])
+    assert np.array_equal(b_unc, ref["bid_prc"])                # un-crossed prices match the oracle
+    assert np.array_equal(a_unc, ref["ask_prc"])
+    assert np.array_equal(bid_ex[bi], ref["bid_exchange_time"])  # exchange_times unchanged by un-crossing
     assert np.array_equal(ask_ex[ai], ref["ask_exchange_time"])
+    assert np.all(a_unc >= b_unc)                              # and the result is genuinely UNCROSSED
 
 
 @pytest.mark.skipif(not _HAS_DATA, reason="DATA_DIR not configured")
@@ -157,16 +195,20 @@ def _next_snapshot_r2(blk: str, listing: str) -> float:
 
 @pytest.mark.skipif(not _HAS_DATA, reason="DATA_DIR not configured")
 @pytest.mark.parametrize("listing, published_r2", [
-    ("byb_eth_usdt_p", 0.286),     # slow ~20ms feed -> merge adds a clear lift
-    ("okx_eth_usdt_p", 0.476),     # slow ~20ms feed -> bigger lift
+    # baseline after the sweep fix + the tick-aware un-cross (un-crossing is a rare/shallow correction,
+    # so it barely moves R2: byb 0.567 -> 0.566, okx 0.531 -> 0.534).
+    ("byb_eth_usdt_p", 0.566),     # slow ~20ms feed -> merge adds a clear lift
+    ("okx_eth_usdt_p", 0.534),     # slow ~20ms feed -> bigger lift
 ])
 def test_merged_levels_preserves_predictive_lift(listing, published_r2):
     """Guards the SIGNAL, not just the shape: the production stream must reproduce
     notebook 02's next-snapshot R2 (so a change that still builds a valid file but
-    loses the predictive merge is caught)."""
+    loses the predictive merge is caught) — and the un-crossed book never crosses."""
     blocks = io.list_blocks(listing, "merged_levels")
     if not blocks:
         pytest.skip(f"no merged_levels blocks for {listing}")
+    df = io.load_block(blocks[0], listing, "merged_levels")
+    assert (df["ask_prc"] >= df["bid_prc"]).all()            # the un-crossed book is never crossed
     r2 = _next_snapshot_r2(blocks[0], listing)
     assert r2 == pytest.approx(published_r2, abs=0.05)        # reproduce the positive lift
     assert r2 > 0.2
@@ -255,3 +297,41 @@ def test_merged_levels_bin_spot_builds():
     assert df.columns == ["rx_time", "bid_prc", "ask_prc", "bid_exchange_time", "ask_exchange_time"]
     assert (df["bid_prc"] > 0).all() and (df["ask_prc"] > 0).all()
     assert df["rx_time"].n_unique() == len(df)
+
+
+# ── tick sizes (tick_sizes.toml) ─────────────────────────────────────────────
+
+_CONFIGURED_LISTINGS = sorted(io._TICK_SIZES)               # every listing in tick_sizes.toml (auto-covers new ones)
+
+
+def test_tick_size_config_loads_and_raises_on_unknown():
+    assert io.tick_size("byb_eth_usdt_p") == 0.01           # ETH: $0.01 everywhere
+    assert io.tick_size("okx_btc_usdt_p") == 0.1            # BTC: $0.1 …
+    assert io.tick_size("bin_btc_usdt") == 0.01             # … except binance SPOT BTC (finer $0.01)
+    with pytest.raises(KeyError):                            # unconfigured listing -> raise (don't guess a tick)
+        io.tick_size("byb_sol_usdt_p")
+
+
+@pytest.mark.skipif(not _HAS_DATA, reason="DATA_DIR not configured")
+@pytest.mark.parametrize("listing", _CONFIGURED_LISTINGS)
+def test_tick_size_matches_inferred_from_data(listing):
+    """Validate EVERY configured tick against the data THREE independent ways, so it's verified not
+    guessed (magnitude-robust: tolerances scale with the price / tick, since a $95k BTC price carries
+    more float noise than a $3.5k ETH one):
+      (1) every price is an integer multiple of it — all quotes live on the tick grid (the strongest);
+      (2) it equals the minimum gap between distinct prices — it is the finest resolution seen;
+      (3) it equals the minimum positive bid-ask spread — the book reaches exactly one tick wide."""
+    blk = io.list_blocks(listing, "front_levels")[0]
+    fl = io.load_block(blk, listing, "front_levels").select("bid_prc", "ask_prc").drop_nulls()
+    bid, ask = fl["bid_prc"].to_numpy(), fl["ask_prc"].to_numpy()
+    tick = io.tick_size(listing)
+    px = np.unique(np.concatenate([bid, ask]))
+
+    # (1) every price sits on the tick grid: price / tick is an integer (to magnitude-relative float noise)
+    assert np.all(np.abs(px - np.round(px / tick) * tick) < np.abs(px) * 1e-9 + 1e-9), "a price is off the tick grid"
+    # (2) the tick is the finest resolution: the min gap between distinct prices == tick
+    d = np.diff(np.sort(px)); d = d[d > tick * 0.5]         # drop any float-dup near-zero gaps
+    assert abs(float(np.min(d)) - tick) < tick * 1e-4
+    # (3) the book reaches exactly one tick wide: the min positive bid-ask spread == tick
+    sp = (ask - bid); sp = sp[sp > tick * 0.5]
+    assert abs(float(np.min(sp)) - tick) < tick * 1e-4

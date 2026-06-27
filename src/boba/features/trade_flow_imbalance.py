@@ -31,23 +31,24 @@ import math
 import numpy as np
 
 from boba.ema import KernelMeanEMA
-from boba.features.base import FeatureSpec, ParamKind, Params, register
-from boba.research.screening import ScreeningContext
+from boba.features.base import Config, FeatureSpec, ParamKind, Params, RawData, SharedData, Trade, register
+from boba.features.shared import flow_at
 
 
-def _exchanges(ctx: ScreeningContext) -> tuple[str, ...]:
-    return (ctx.target.split("_", 1)[0],) + tuple(ctx.sources)
+def _ex(listing: str) -> str:
+    """The short exchange key (leg key) for a full listing id, e.g. 'byb_eth_usdt_p' -> 'byb'."""
+    return listing.split("_", 1)[0]
 
 
 def _trade_sign(lifts_ask: float) -> float:
     return 1.0 if lifts_ask > 0.0 else -1.0
 
 
-def _trade_volume_stream(trades: tuple) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """`(rx, px, lifts_ask, qty)` rows -> `(ts, signed_volume_sum, total_volume_sum)` per receive
-    timestamp. VOLUME-weighted (`qty`, not notional) so the feature is exactly odd under reflection."""
-    rx, px, lifts, qty = trades
-    ok = ((px > 0.0) & (qty > 0.0) & np.isfinite(px) & np.isfinite(qty) & np.isfinite(lifts))  # drop bad prc=qty=0 prints
+def _trade_volume_stream(trade: Trade) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """`Trade` rows -> `(ts, signed_volume_sum, total_volume_sum)` per receive timestamp. VOLUME-weighted
+    (`qty`, not notional) so the feature is exactly odd under reflection; bad prc<=0 / qty<=0 prints dropped."""
+    rx, px, lifts, qty = trade.rx, trade.price, trade.lifts_ask, trade.qty
+    ok = ((px > 0.0) & (qty > 0.0) & np.isfinite(px) & np.isfinite(qty) & np.isfinite(lifts))
     if not np.any(ok):
         return rx[:0], qty[:0].astype(float), qty[:0].astype(float)
     rx, lifts, qty = rx[ok], lifts[ok], qty[ok]
@@ -56,27 +57,31 @@ def _trade_volume_stream(trades: tuple) -> tuple[np.ndarray, np.ndarray, np.ndar
     return uniq, np.bincount(inv, weights=signed), np.bincount(inv, weights=qty)
 
 
-def vectorized(ctx: ScreeningContext, params: Params) -> dict[str, np.ndarray]:
-    """{exchange -> EMA(signed volume) / EMA(volume)}, on the anchor grid (in [-1, 1])."""
+def _imbalance_leg(trade: Trade, clock: np.ndarray, event_ts: np.ndarray, n: int) -> np.ndarray:
+    """One venue's signed-volume imbalance `EMA(signed)/EMA(total)` at every `event_ts` (in [-1, 1]):
+    the common per-event EMA weights cancel in the ratio, leaving the volume-weighted signed fraction."""
+    rx, signed, total = _trade_volume_stream(trade)
+    num = flow_at(clock, rx, signed, event_ts, n)
+    den = flow_at(clock, rx, total, event_ts, n)
+    return num / np.where(den == 0.0, np.nan, den)
+
+
+def vectorized(raw: RawData, shared: SharedData, config: Config, params: Params) -> dict[str, np.ndarray]:
+    """{exchange -> EMA(signed volume) / EMA(volume)}, one value per `event_ts` (causal, in [-1, 1])."""
     n = params
-    out: dict[str, np.ndarray] = {}
-    for ex in _exchanges(ctx):
-        rx, signed, value = _trade_volume_stream(ctx._trades[ex])
-        num = ctx._flow_at(ctx.anchor_ts, signed, n, src_rx=rx)
-        den = ctx._flow_at(ctx.anchor_ts, value, n, src_rx=rx)
-        out[ex] = num / np.where(den == 0.0, np.nan, den)
-    return out
+    return {_ex(l): _imbalance_leg(raw.listings[l].trade, shared.clock, shared.event_ts, n)
+            for l in config.all_listings}
 
 
 class LiveTradeFlowImbalance:
-    """O(1) streaming build. Same-timestamp trades are summed into one signed/total notional flow event."""
+    """O(1) streaming build, one signed/total-volume EMA pair per venue. Same-timestamp trades are summed
+    into one signed/total volume flow event; `refresh()` injects each venue's SUMMED flow, then decays all
+    legs once iff a trade landed (shared trade clock)."""
 
-    def __init__(self, ctx: ScreeningContext, params: Params):
-        coin = ctx.coin
-        self.exes = _exchanges(ctx)
+    def __init__(self, config: Config, params: Params):
+        self.exes = tuple(_ex(l) for l in config.all_listings)
         self.keys = self.exes
-        self._key_of = {f"{ex}_{coin}": ex for ex in self.exes}
-        self.fuse_trades = frozenset()
+        self._key_of = {l: _ex(l) for l in config.all_listings}    # full listing -> short key
         self.num = {ex: KernelMeanEMA(params) for ex in self.exes}
         self.den = {ex: KernelMeanEMA(params) for ex in self.exes}
         self.ts_signed = {ex: 0.0 for ex in self.exes}
@@ -84,10 +89,10 @@ class LiveTradeFlowImbalance:
         self.ts_got = {ex: False for ex in self.exes}
         self.was_trade_present = False
 
-    def on_book(self, ev) -> None:
+    def on_book(self, ev) -> None:                                 # book-only does nothing — this is a pure trade flow
         pass
 
-    def on_trade(self, ev) -> None:
+    def on_trade(self, ev) -> None:                                # accumulate this venue's signed/total volume at the ts
         self.was_trade_present = True
         ex = self._key_of.get(ev.listing)
         if ex is None:
@@ -99,7 +104,7 @@ class LiveTradeFlowImbalance:
         self.ts_value[ex] += ev.qty
         self.ts_got[ex] = True
 
-    def refresh(self) -> None:
+    def refresh(self) -> None:                                     # ONE per timestamp: inject SUMMED flow, then decay AT MOST once
         traded, self.was_trade_present = self.was_trade_present, False
         for ex in self.exes:
             if self.ts_got[ex] and self.ts_value[ex] > 0.0:
@@ -124,8 +129,8 @@ class LiveTradeFlowImbalance:
 SPEC = FeatureSpec(
     name="trade_flow_imbalance",
     vectorized=vectorized,
-    make_streaming=lambda ctx, params: LiveTradeFlowImbalance(ctx, params),
-    keys_for=lambda ctx, params: (ctx.target.split("_", 1)[0],) + tuple(ctx.sources),
+    make_streaming=lambda config, params: LiveTradeFlowImbalance(config, params),
+    keys_for=lambda config, params: tuple(_ex(l) for l in config.all_listings),
     mirror=np.negative,
     param_kind=ParamKind.SINGLE,
 )

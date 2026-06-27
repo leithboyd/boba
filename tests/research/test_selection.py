@@ -29,7 +29,7 @@ def _empty_ctx(**over) -> ScreeningContext:
     kw = dict(
         block="syn", coin="x", target="byb_x", sources=("aaa", "bbb"), horizon_ns=0,
         yardstick_span=10, mid_stream={}, merged_ts=np.empty(0), anchor_ts=np.empty(0),
-        tick_at_anchor=np.empty(0), sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0),
+        sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0),
         price_target=np.empty(0), rate_target=np.empty(0), base=[], vol_level=np.empty(0),
         rate_level=np.empty(0), vol_regime=np.empty(0),
         raw_events=RawEventStream(*([np.empty(0)] * 8), ()),

@@ -6,8 +6,8 @@ The feature is:
 
     EMA(Δlog mid) / σ_ev
 
-where `σ_ev` is the target volatility yardstick from `ScreeningContext` / `LiveYardstick`. It fans
-out over every exchange -- the target plus each foreign source; `params = N` (the EMA span).
+where `σ_ev` is the target volatility yardstick (`shared_data.vol_yardstick` / `VolYardstick`). It
+fans out over every exchange -- the target plus each foreign source; `params = N` (the EMA span).
 
 WHY it might predict (a falsifiable hypothesis). Recent log-mid moves tend to *continue* at short
 microstructure horizons (momentum / trend), rather than immediately reverting. So a positive EMA of
@@ -22,108 +22,99 @@ instrument's own future returns, the direct macro-horizon analogue of this micro
 
 Mirror augmentation: log returns negate under price reflection while `σ_ev` is even, so the feature
 is ODD and `SPEC.mirror` is `np.negative`.
+
+See `AUTHORING.md` (this directory) for the EMA-type and inject/decay rules these obey.
 """
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import numpy as np
 
 from boba.ema import KernelMeanEMA
-from boba.features.base import FeatureSpec, ParamKind, Params, register
-from boba.research.screening import LiveYardstick, ScreeningContext
+from boba.features.base import Config, Params, RawData, Series, SharedData, FeatureSpec, ParamKind, register
+from boba.features.shared import flow_at
+from boba.features.streaming import LiveMergedBook, VolYardstick
 
 
-def _exchanges(ctx: ScreeningContext) -> tuple[str, ...]:
-    return (ctx.target.split("_", 1)[0],) + tuple(ctx.sources)
+def _ex(listing: str) -> str:
+    """The short exchange key (leg key) for a full listing id, e.g. 'byb_eth_usdt_p' -> 'byb'."""
+    return listing.split("_", 1)[0]
 
 
-def _move_stream(mid_stream: tuple[np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """`(rx, mid)` level rows -> non-zero `(rx, Δlog(mid))`, one final mid per timestamp."""
-    rx, mid = mid_stream
-    ok = (mid > 0.0) & np.isfinite(mid)
-    rx, mid = rx[ok], mid[ok]
+def _move_stream(mid: Series) -> tuple[np.ndarray, np.ndarray]:
+    """A venue's mid `Series` -> non-zero `(rx, Δlog(mid))`, keeping the FINAL mid per timestamp.
+    Same-rx mids collapse to the last row, then consecutive non-zero log-moves are kept."""
+    rx, m = np.asarray(mid.rx), np.asarray(mid.value)
+    ok = (m > 0.0) & np.isfinite(m)
+    rx, m = rx[ok], m[ok]
     if len(rx) < 2:
-        return rx[:0], mid[:0].astype(float)
-    keep = np.concatenate([rx[1:] != rx[:-1], [True]])
-    rx, mid = rx[keep], mid[keep]
+        return rx[:0], m[:0].astype(float)
+    keep = np.concatenate([rx[1:] != rx[:-1], [True]])        # last mid per timestamp
+    rx, m = rx[keep], m[keep]
     if len(rx) < 2:
-        return rx[:0], mid[:0].astype(float)
-    dlog = np.diff(np.log(mid))
+        return rx[:0], m[:0].astype(float)
+    dlog = np.diff(np.log(m))
     move = dlog != 0.0
     return rx[1:][move], dlog[move]
 
 
-def _leg(ctx: ScreeningContext, rx: np.ndarray, ret: np.ndarray, span: int) -> np.ndarray:
-    E = ctx._flow_at(ctx.anchor_ts, ret, span, src_rx=rx)
-    W = ctx._flow_at(ctx.anchor_ts, np.ones(ret.size), span, src_rx=rx)
-    return E / np.where(W == 0.0, np.nan, W)
+def _pm_leg(mid: Series, clock: np.ndarray, event_ts: np.ndarray, n: int) -> np.ndarray:
+    """One venue's `EMA(Δlog mid)` read as `E/W` at every `event_ts`: its non-zero log-mid moves decayed
+    once per trade-clock tick, read live (committed-per-tick + the partial epoch since the last tick).
+    Volatility normalisation (`/ σ_ev`) is applied by the caller."""
+    rx, ret = _move_stream(mid)
+    e = flow_at(clock, rx, ret, event_ts, n)
+    w = flow_at(clock, rx, np.ones(ret.size), event_ts, n)
+    return e / np.where(w == 0.0, np.nan, w)
 
 
-def vectorized(ctx: ScreeningContext, params: Params) -> dict[str, np.ndarray]:
-    """{exchange -> E/W EMA of that venue's log-mid moves divided by target σ_ev}."""
+def vectorized(raw: RawData, shared: SharedData, config: Config, params: Params) -> dict[str, np.ndarray]:
+    """{exchange -> E/W EMA of that venue's log-mid moves / σ_ev}, one value per `event_ts` (causal)."""
     n = params
-    out: dict[str, np.ndarray] = {}
-    for ex in _exchanges(ctx):
-        rx, ret = _move_stream(ctx._mids[ex])
-        out[ex] = _leg(ctx, rx, ret, n) / ctx.sigma_at_anchor
-    return out
+    sig = np.where(shared.vol_yardstick == 0.0, np.nan, shared.vol_yardstick)   # σ_ev=0 only in warm-up -> clean NaN, not inf
+    return {_ex(l): _pm_leg(shared.listings[l].mid, shared.clock, shared.event_ts, n) / sig
+            for l in config.all_listings}
 
 
 class LivePriceMomentum:
-    """O(1) streaming build. Price state follows the context's mid policy; returns are sparse flows."""
+    """O(1) streaming build, one leg per venue. Each venue carries a `KernelMeanEMA` over its non-zero
+    log-mid moves; the mid follows the listing's mid policy (book-only, or trade-fused for the listings
+    in `fuse_trades`). `refresh()` injects each venue's move, feeds the target log-mid to a composed
+    `VolYardstick` (σ_ev), then decays all legs + the yardstick once iff a trade landed (shared clock)."""
 
-    def __init__(self, ctx: ScreeningContext, params: Params):
-        self.target = ctx.target
-        self.exes = _exchanges(ctx)
+    def __init__(self, config: Config, params: Params):
+        self.target = config.target_listing
+        self.exes = tuple(_ex(l) for l in config.all_listings)
         self.keys = self.exes
-        self._key_of = {f"{ex}_{ctx.coin}": ex for ex in self.exes}
-        self.fuse_trades = frozenset(
-            f"{ex}_{ctx.coin}" for ex in self.exes if ctx.mid_stream.get(ex, "front_levels") == "merged_levels"
-        )
-        self.bid: dict[str, float] = {}
-        self.ask: dict[str, float] = {}
-        self.bid_t: dict[str, int] = {}
-        self.ask_t: dict[str, int] = {}
+        self._key_of = {l: _ex(l) for l in config.all_listings}   # full listing -> short key
+        fuse_tick = {l: config.tick_size[l] for l in config.all_listings
+                     if config.mid_stream.get(l, "front_levels") == "merged_levels"}   # KeyError -> no tick for a fused listing
+        self.book = LiveMergedBook(fuse_tick)        # shared merged-book reconstruction (fuse + un-cross); read .quote()
         self.prev_log = {ex: None for ex in self.exes}
         self.leg = {ex: KernelMeanEMA(params) for ex in self.exes}
-        self.yard = LiveYardstick(ctx.yardstick_span)
+        self.yard = VolYardstick(config.yardstick_span)
         self.was_trade_present = False
 
-    def _side(self, listing: str, is_ask, px: float, t: int) -> None:
-        held_t = self.ask_t if is_ask else self.bid_t
-        if t > held_t.get(listing, -1):
-            (self.ask if is_ask else self.bid)[listing] = px
-            held_t[listing] = t
-
-    def _mid(self, listing: str) -> Optional[float]:
-        b, a = self.bid.get(listing), self.ask.get(listing)
-        return None if b is None or a is None else 0.5 * (b + a)
-
     def on_book(self, ev) -> None:
-        if ev.listing not in self._key_of:
-            return
-        if ev.listing in self.fuse_trades:
-            self._side(ev.listing, False, ev.bid, ev.exch_time)
-            self._side(ev.listing, True, ev.ask, ev.exch_time)
-        else:
-            self.bid[ev.listing] = ev.bid
-            self.ask[ev.listing] = ev.ask
+        self.book.on_book(ev)
 
     def on_trade(self, ev) -> None:
-        if ev.listing in self.fuse_trades:
-            self._side(ev.listing, ev.lifts_ask, ev.px, ev.exch_time)
+        self.book.on_trade(ev)
         self.was_trade_present = True
 
     def refresh(self) -> None:
         traded, self.was_trade_present = self.was_trade_present, False
-        target_mid = self._mid(self.target)
+        tq = self.book.quote(self.target)
+        target_mid = 0.5 * (tq[0] + tq[1]) if tq is not None else None      # mid from the un-crossed (bid, ask)
         self.yard.on_target_logmid(math.log(target_mid) if target_mid is not None and target_mid > 0.0 else None)
 
         for listing, ex in self._key_of.items():
-            mid = self._mid(listing)
-            if mid is None or mid <= 0.0:
+            q = self.book.quote(listing)
+            if q is None:
+                continue
+            mid = 0.5 * (q[0] + q[1])
+            if mid <= 0.0:
                 continue
             log_mid = math.log(mid)
             prev = self.prev_log[ex]
@@ -144,9 +135,9 @@ class LivePriceMomentum:
 SPEC = FeatureSpec(
     name="price_momentum",
     vectorized=vectorized,
-    make_streaming=lambda ctx, params: LivePriceMomentum(ctx, params),
-    keys_for=lambda ctx, params: (ctx.target.split("_", 1)[0],) + tuple(ctx.sources),
-    mirror=np.negative,
-    param_kind=ParamKind.SINGLE,
+    make_streaming=lambda config, params: LivePriceMomentum(config, params),
+    keys_for=lambda config, params: tuple(_ex(l) for l in config.all_listings),
+    mirror=np.negative,   # log returns negate under price reflection; σ_ev is even -> the feature is ODD
+    param_kind=ParamKind.SINGLE,                             # params = N (a single EMA span)
 )
 register(SPEC)

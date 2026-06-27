@@ -21,49 +21,13 @@ from typing import Optional
 
 import numpy as np
 
-from boba.ema import KernelMeanEMA
-from boba.features.base import BookEvent, FeatureSpec, Params, TradeEvent, VectorizedBuilder
-
-
-# --------------------------------------------------------------------------------------------------
-# The shared yardstick — its own streaming part, parity-tested once. Feature streaming classes
-# COMPOSE this rather than recomputing σ_ev, so a feature's parity validates only its own maths.
-# --------------------------------------------------------------------------------------------------
-class LiveYardstick:
-    """Streaming σ_ev (composes `boba.ema.KernelMeanEMA`): the online twin of `ScreeningContext.
-    sigma_at_anchor`. It decays on the shared trade clock and injects a squared return on each
-    *real* target mid-move. (λ_ev is a vectorized context quantity used for the rate target; it is
-    not streamed by features, so it lives only on the context.)
-    """
-
-    __slots__ = ("vol", "_prev")
-
-    def __init__(self, span: int):
-        self.vol = KernelMeanEMA(span)      # E/W mean of squared target moves -> sqrt(E/W) = σ_ev
-        self._prev: Optional[float] = None  # last target log-mid, to detect a real move
-
-    def on_target_logmid(self, log_mid: Optional[float]) -> None:
-        """Feed the current target log-mid (or None before it has quoted). Injects `(Δlog)**2`
-        iff the mid actually moved — a flow on the byb-move stream. Does NOT decay."""
-        if log_mid is None:
-            return
-        if self._prev is not None and log_mid != self._prev:
-            self.vol.add((log_mid - self._prev) ** 2)
-        self._prev = log_mid
-
-    def tick(self) -> None:
-        """Advance the shared trade clock one step (decay E and W)."""
-        self.vol.tick()
-
-    def sigma(self) -> float:
-        """σ_ev = sqrt(E/W) — RMS mid-move per move, live (nan during warm-up)."""
-        return self.vol.value() ** 0.5
-
-
-def _ffill(rx: np.ndarray, val: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Causal forward-fill: `val` of the last `rx <= t[i]`; NaN before the first `rx` (no wrap)."""
-    idx = np.searchsorted(rx, t, "right") - 1
-    return np.where(idx < 0, np.nan, val[np.clip(idx, 0, len(val) - 1)])
+from boba.features.base import (
+    BookEvent, Config, FeatureSpec, FrontLevels, ListingRaw, MergedLevels, Params,
+    RawData, SharedData, Trade, TradeEvent, VectorizedBuilder,
+)
+from boba.features.shared import _ffill, build_shared_data, hold_last
+from boba.features.rate_momentum import vectorized as _rate_momentum_vec   # the gate's Gate-B momenta are
+from boba.features.vol_momentum import vectorized as _vol_momentum_vec     # real features, built + sampled here
 
 
 def _active_grid(start_ns: int, end_ns: int, step_ns: int, event_ts: np.ndarray) -> np.ndarray:
@@ -120,7 +84,6 @@ class ScreeningContext:
     # --- shared trade clock + causal evaluation grid ---
     merged_ts: np.ndarray             # unique trade-timestamps — the shared decay clock
     anchor_ts: np.ndarray             # the evaluation grid (past warm-up)
-    tick_at_anchor: np.ndarray        # last trade-clock tick <= each anchor
 
     # --- yardstick vectors on the grid (σ_ev, λ_ev) at span = yardstick_span ---
     sigma_at_anchor: np.ndarray
@@ -140,55 +103,62 @@ class ScreeningContext:
     raw_events: RawEventStream
 
     # --- building blocks a feature derives its inputs from (kept here so build_context loads once) ---
-    _mids: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict, repr=False)
-    _books: dict[str, tuple] = field(default_factory=dict, repr=False)  # raw front_levels per ex: (rx, bid, bid_qty, ask, ask_qty)
-    _trades: dict[str, tuple] = field(default_factory=dict, repr=False)  # raw trades per ex: (rx, px, lifts_ask, qty)
-    target_logmid_on_clock: np.ndarray = field(default=None, repr=False)  # log target mid at each tick
-    _mv_rx: np.ndarray = field(default=None, repr=False)                  # target move timestamps
-    _mv_r2: np.ndarray = field(default=None, repr=False)                  # squared target moves
-    _clock_dt: np.ndarray = field(default=None, repr=False)              # seconds between trade ticks
+    _mids: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict, repr=False)  # per-ex mid (echo-netting)
+    _mv_rx: np.ndarray = field(default=None, repr=False)                  # target move timestamps (selection.py)
 
-    # --- accessors a feature builds on ---
-    def mid_on_clock(self, source: str) -> np.ndarray:
-        """Causal mid of `source` at each trade-clock tick (NaN before its first quote)."""
-        rx, mid = self._mids[source]
-        return _ffill(rx, mid, self.merged_ts)
+    # --- the STANDALONE feature inputs (boba.features types) — what migrated features read. The
+    # builder outputs one value per `shared_data.event_ts`; build_family/parity_check sample those onto
+    # `anchor_ts` (== computing at the anchor, since a feature is piecewise-constant between events). ---
+    raw_data: Optional[RawData] = field(default=None, repr=False)
+    shared_data: Optional[SharedData] = field(default=None, repr=False)
+    config: Optional[Config] = field(default=None, repr=False)
 
-    def mid_at_anchor(self, source: str) -> np.ndarray:
-        """Causal mid of `source` at each grid anchor — the freshest value, never stale."""
-        rx, mid = self._mids[source]
-        return _ffill(rx, mid, self.anchor_ts)
+    def sample_to_anchor(self, event_grid_vec: np.ndarray) -> np.ndarray:
+        """Sample a per-`event_ts` feature vector onto the research `anchor_ts` (causal forward-fill)."""
+        return _ffill(self.shared_data.event_ts, event_grid_vec, self.anchor_ts)
 
-    def _flow_at(self, anchors: np.ndarray, val: np.ndarray, span: float, src_rx: np.ndarray = None) -> np.ndarray:
-        """EWMA of `val` over an EVENT stream `src_rx` (default the target-MOVE stream `_mv_rx`), decayed
-        once per trade-timestamp, read AT each anchor (committed-per-trade EMA + the partial epoch since
-        the last trade). `val` is aligned to `src_rx`. Reused by any sparse flow (σ_ev, OFI, …)."""
-        from scipy.signal import lfilter
 
-        a = 2.0 / (span + 1.0)
-        mv_rx = self._mv_rx if src_rx is None else src_rx
-        n_ticks = len(self.merged_ts)
-        k = np.searchsorted(self.merged_ts, mv_rx, "left")
-        ep = np.bincount(k, weights=val, minlength=n_ticks + 1)
-        x = np.zeros(n_ticks + 1)
-        x[1:] = a * (1.0 - a) * ep[:-1]
-        com = lfilter([1.0], [1.0, -(1.0 - a)], x)
-        ta = np.searchsorted(self.merged_ts, anchors, "right") - 1
-        cs = np.concatenate([[0.0], np.cumsum(val)])
-        partial = cs[np.searchsorted(mv_rx, anchors, "right")] - cs[np.searchsorted(mv_rx, self.merged_ts[ta], "right")]
-        return com[ta + 1] + a * partial
+def _load_raw_data(block, coin, listings, mid_stream, cutoff) -> RawData:
+    """Load the standalone `RawData` (front_levels / trade / merged_levels per listing, WITH exchange_time)
+    that `build_shared_data` consumes. Cut to `rx <= cutoff` (None = whole block), with the same prc/qty
+    trade filter as the gate path so `shared_data`'s clock/yardsticks/mids reproduce the context's."""
+    import polars as pl
 
-    def yardsticks_at(self, anchors: np.ndarray, span: float) -> tuple[np.ndarray, np.ndarray]:
-        """`(σ_ev, λ_ev)` at arbitrary anchors / span — for the momentum controls and alt spans."""
-        from scipy.signal import lfilter
+    import boba.io as io
+    from boba.io import load_block
 
-        a = 2.0 / (span + 1.0)
-        e_sq = self._flow_at(anchors, self._mv_r2, span)
-        e_mv = self._flow_at(anchors, np.ones(self._mv_r2.size), span)
-        e_dt = lfilter([a], [1.0, -(1.0 - a)], self._clock_dt)[np.searchsorted(self.merged_ts, anchors, "right") - 1]
-        sig = np.sqrt(e_sq / np.maximum(e_mv, 1e-12))
-        lam = e_mv / np.maximum(e_dt, 1e-12)
-        return sig, lam
+    def cut(stream):
+        if cutoff is None:
+            return stream
+        m = stream.rx <= cutoff
+        return type(stream)(*(c[m] for c in stream))
+
+    out: dict[str, ListingRaw] = {}
+    for listing in listings:
+        fl = (load_block(block, listing, "front_levels")
+              .select("rx_time", "exchange_time", "bid_prc", "bid_qty", "ask_prc", "ask_qty")
+              .drop_nulls(["rx_time", "bid_prc", "bid_qty", "ask_prc", "ask_qty"])
+              .with_columns(pl.col("exchange_time").fill_null(pl.col("rx_time"))))
+        front = FrontLevels(fl["rx_time"].cast(pl.Int64).to_numpy(), fl["exchange_time"].cast(pl.Int64).to_numpy(),
+                            fl["bid_prc"].to_numpy(), fl["bid_qty"].to_numpy(), fl["ask_prc"].to_numpy(), fl["ask_qty"].to_numpy())
+        td = (load_block(block, listing, "trade").select("rx_time", "exchange_time", "prc", "qty", "aggressor")
+              .filter((pl.col("prc") > 0) & (pl.col("qty") > 0))
+              .with_columns(pl.col("exchange_time").fill_null(pl.col("rx_time"))))
+        trade = Trade(td["rx_time"].cast(pl.Int64).to_numpy(), td["exchange_time"].cast(pl.Int64).to_numpy(),
+                      td["prc"].to_numpy(), io._trade_lifts_ask(listing, td["aggressor"].to_numpy()).astype(float),
+                      td["qty"].to_numpy())
+        merged = None
+        if mid_stream[listing] == "merged_levels":
+            ml = (load_block(block, listing, "merged_levels")
+                  .select("rx_time", "bid_prc", "ask_prc", "bid_exchange_time", "ask_exchange_time")
+                  .drop_nulls(["rx_time", "bid_prc", "ask_prc"])
+                  .with_columns(pl.col("bid_exchange_time").fill_null(pl.col("rx_time")),
+                                pl.col("ask_exchange_time").fill_null(pl.col("rx_time"))))
+            merged = MergedLevels(ml["rx_time"].cast(pl.Int64).to_numpy(), ml["bid_exchange_time"].cast(pl.Int64).to_numpy(),
+                                  ml["ask_exchange_time"].cast(pl.Int64).to_numpy(), ml["bid_prc"].to_numpy(), ml["ask_prc"].to_numpy())
+        out[listing] = ListingRaw(front_levels=cut(front), trade=cut(trade),
+                                  merged_levels=None if merged is None else cut(merged))
+    return RawData(listings=out)
 
 
 def build_context(
@@ -256,55 +226,49 @@ def build_context(
               .filter((pl.col("prc") > 0) & (pl.col("qty") > 0)))
         trade_ts.append(td["rx_time"].cast(pl.Int64).to_numpy())
 
+    cutoff_ns = None                                     # the hours cutoff (None = whole block); also caps raw_data below
     if hours is not None:                                # read only the first `hours` of the block
         first = [a[0] for a in [mids[e][0] for e in all_ex] + trade_ts if len(a)]
-        cutoff = min(first) + int(hours * 3600 * 1_000_000_000)
+        cutoff = cutoff_ns = min(first) + int(hours * 3600 * 1_000_000_000)
         mids = {e: (rx[rx <= cutoff], m[rx <= cutoff]) for e, (rx, m) in mids.items()}
         books_raw = {e: tuple(col[b[0] <= cutoff] for col in b) for e, b in books_raw.items()}
         trade_ts = [a[a <= cutoff] for a in trade_ts]
-
-    # books a feature consumes (drop exchange_time, which only the raw-event stream below needs)
-    books = {e: (rx, bid, bq, ask, aq) for e, (rx, _et, bid, bq, ask, aq) in books_raw.items()}
-
-    def load_trade_flow(ex):                             # full raw trades WITH side — for trade-flow features.
-        td = (load_block(block, f"{ex}_{coin}", "trade")
-              .select("rx_time", "prc", "qty", "aggressor")
-              .filter((pl.col("prc") > 0) & (pl.col("qty") > 0)))
-        rx = td["rx_time"].cast(pl.Int64).to_numpy()
-        out = (rx, td["prc"].to_numpy(),
-               io._trade_lifts_ask(f"{ex}_{coin}", td["aggressor"].to_numpy()).astype(float),
-               td["qty"].to_numpy())
-        if hours is not None:
-            return tuple(col[rx <= cutoff] for col in out)
-        return out
-
-    trades = {ex: load_trade_flow(ex) for ex in all_ex}
 
     merged_ts = np.unique(np.concatenate(trade_ts))
     n_ticks = len(merged_ts)
     event_ts = np.unique(np.concatenate([mids[e][0] for e in all_ex] + trade_ts))   # book + trade, any venue
 
-    log_mid_target = np.log(_ffill(*mids[target_ex], merged_ts))
-
-    # target move stream (for the yardsticks + the count target)
+    # target move stream: mv_rx (timestamps of real moves — selection.py reads `_mv_rx`); cum_mv + t_rx/t_mid
+    # for the count / return targets. σ_ev / λ_ev are NOT computed here — they live in shared_data (below).
     t_rx0, t_mid0 = mids[target_ex]
     keep = np.concatenate([t_rx0[1:] != t_rx0[:-1], [True]])
     t_rx, t_mid = t_rx0[keep], t_mid0[keep]
     t_lm = np.log(t_mid)
     blr = np.empty_like(t_lm); blr[0] = 0.0; blr[1:] = np.diff(t_lm)
     mv = blr != 0.0
-    mv_rx, mv_r2 = t_rx[mv], blr[mv] ** 2
+    mv_rx = t_rx[mv]
     cum_mv = np.concatenate([[0.0], np.cumsum(mv.astype(float))])
-    clock_dt = np.zeros(n_ticks); clock_dt[1:] = np.diff(merged_ts) / 1e9
+
+    # the STANDALONE feature inputs (boba.features): raw_data -> shared_data, built ONCE and shared by the
+    # migrated features AND the gate path. σ_ev / λ_ev (vol_yardstick / rate_yardstick) live here only.
+    full_listings = tuple(f"{ex}_{coin}" for ex in all_ex)
+    cfg_mid_stream = {f"{ex}_{coin}": mid_stream[ex] for ex in all_ex}
+    # tick per FUSED listing (the merged book the streaming un-crosses) — io.tick_size RAISES if a fused
+    # listing has no configured tick, so a missing tick fails fast here.
+    cfg_tick = {l: io.tick_size(l) for l in full_listings if cfg_mid_stream[l] == "merged_levels"}
+    config = Config(target_listing=target, other_listings=tuple(f"{s}_{coin}" for s in sources),
+                    coin=coin, mid_stream=cfg_mid_stream, yardstick_span=yardstick_span, tick_size=cfg_tick)
+    raw_data = _load_raw_data(block, coin, full_listings, cfg_mid_stream, cutoff_ns)
+    shared_data = build_shared_data(raw_data, config)
 
     ctx = ScreeningContext(
         block=block, coin=coin, target=target, sources=tuple(sources), horizon_ns=horizon_ns,
         yardstick_span=yardstick_span, mid_stream=mid_stream,
-        merged_ts=merged_ts, anchor_ts=np.empty(0), tick_at_anchor=np.empty(0),
+        merged_ts=merged_ts, anchor_ts=np.empty(0),
         sigma_at_anchor=np.empty(0), lam_at_anchor=np.empty(0), price_target=np.empty(0), rate_target=np.empty(0),
         base=[], vol_level=np.empty(0), rate_level=np.empty(0), vol_regime=np.empty(0),
-        raw_events=RawEventStream(*([np.empty(0)] * 8), ()), _mids=mids, _books=books, _trades=trades,
-        target_logmid_on_clock=log_mid_target, _mv_rx=mv_rx, _mv_r2=mv_r2, _clock_dt=clock_dt,
+        raw_events=RawEventStream(*([np.empty(0)] * 8), ()), _mids=mids, _mv_rx=mv_rx,
+        raw_data=raw_data, shared_data=shared_data, config=config,
     )
 
     # causal grid past warm-up
@@ -320,8 +284,11 @@ def build_context(
     if len(anchor_ts) == 0:
         raise ValueError("empty anchor grid — block too thin for the chosen grid and horizon")
     ctx.anchor_ts = anchor_ts
-    ctx.tick_at_anchor = np.searchsorted(merged_ts, anchor_ts, "right") - 1
-    ctx.sigma_at_anchor, ctx.lam_at_anchor = ctx.yardsticks_at(anchor_ts, yardstick_span)
+
+    # σ_ev / λ_ev at the slow span: SAMPLE shared_data's yardsticks onto the anchors (== computing at the
+    # anchor; a yardstick is piecewise-constant between events — proven equal in tests/features/test_shared).
+    ctx.sigma_at_anchor = ctx.sample_to_anchor(shared_data.vol_yardstick)
+    ctx.lam_at_anchor = ctx.sample_to_anchor(shared_data.rate_yardstick)
 
     # price target: byb 100ms forward return / σ_ev (guarded forward-fill — no wrap)
     inow = np.searchsorted(t_rx, anchor_ts, "right") - 1
@@ -335,14 +302,15 @@ def build_context(
                  - cum_mv[np.searchsorted(t_rx, anchor_ts, "right")])
     ctx.rate_target = fwd_count / np.maximum(ctx.lam_at_anchor, 1e-9)
 
-    # Gate-B controls (regime-invariant momenta) + Gate-A regime coordinate (the levels)
-    fast_yard = yardstick_span // 10
-    sig_fast, lam_fast = ctx.yardsticks_at(anchor_ts, fast_yard)
+    # Gate-A regime coordinate (the levels) + Gate-B controls (the regime-invariant momenta). The momenta
+    # are the `vol_momentum` / `rate_momentum` FEATURES (log fast/slow yardstick), built + sampled like any
+    # other feature — not a private inline (so the gate's controls and the feature sweep cannot drift apart).
     ctx.vol_level = np.log(ctx.sigma_at_anchor)
     ctx.rate_level = np.log(ctx.lam_at_anchor)
-    vol_momentum = np.log(sig_fast / ctx.sigma_at_anchor)
-    rate_momentum = np.log(lam_fast / ctx.lam_at_anchor)
-    ctx.base = [rate_momentum, vol_momentum]
+    spans = (yardstick_span // 10, yardstick_span)        # (fast, slow)
+    vm = _vol_momentum_vec(raw_data, shared_data, config, spans)[target_ex]
+    rm = _rate_momentum_vec(raw_data, shared_data, config, spans)[target_ex]
+    ctx.base = [ctx.sample_to_anchor(rm), ctx.sample_to_anchor(vm)]   # [rate_momentum, vol_momentum]
     finite = np.isfinite(ctx.vol_level)
     ctx.vol_regime = np.digitize(ctx.vol_level, np.nanpercentile(ctx.vol_level[finite], [33, 67]))
 
@@ -386,11 +354,18 @@ def build_family(
     n_jobs: int = 1,
 ) -> dict[Params, dict[str, np.ndarray]]:
     """Build the vectorized feature for each `params` token (parallel when `n_jobs > 1`), keyed by the
-    OPAQUE token: `{params -> {leg_key -> vector}}`. Same function for the parity subset and the sweep."""
+    OPAQUE token: `{params -> {leg_key -> vector on anchor_ts}}`. The builder is standalone -- it emits
+    one value per `shared_data.event_ts`; we SAMPLE each leg onto the research `anchor_ts` here (causal
+    forward-fill == computing at the anchor, since a feature is piecewise-constant between events). Same
+    function for the parity subset and the sweep. Each sampled leg is `hold_last`-ed so the model never
+    sees a mid-stream NaN (a span=1 flow's momentary 0/0) — only the leading warm-up NaN remains."""
+    def one(p):
+        legs = vectorized(ctx.raw_data, ctx.shared_data, ctx.config, p)
+        return {k: hold_last(ctx.sample_to_anchor(v)) for k, v in legs.items()}
     if n_jobs <= 1:
-        return {p: vectorized(ctx, p) for p in params_list}
+        return {p: one(p) for p in params_list}
     with ThreadPoolExecutor(max_workers=n_jobs) as pool:
-        return dict(zip(params_list, pool.map(lambda p: vectorized(ctx, p), params_list)))
+        return dict(zip(params_list, pool.map(one, params_list)))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -426,9 +401,9 @@ def parity_check(
     driver validates every feature."""
     anchor = ctx.anchor_ts
     na = min(n_grid, len(anchor))
-    feats = {p: spec.make_streaming(ctx, p) for p in params_list}
+    feats = {p: spec.make_streaming(ctx.config, p) for p in params_list}
     for p, f in feats.items():                              # fail fast on a key mismatch
-        assert tuple(f.keys) == tuple(spec.keys_for(ctx, p)), f"key mismatch for params {p!r}"
+        assert tuple(f.keys) == tuple(spec.keys_for(ctx.config, p)), f"key mismatch for params {p!r}"
     streams = {p: {k: np.full(na, np.nan) for k in f.keys} for p, f in feats.items()}
 
     ev = ctx.raw_events
@@ -451,11 +426,11 @@ def parity_check(
         while i < n and rxL[i] == rx:
             listing = listings[lidL[i]]
             if kindL[i] == 0:
-                bev = BookEvent(listing, tL[i], aL[i], bL[i], cL[i], dL[i])   # build once, share across features
+                bev = BookEvent(listing, rx, tL[i], aL[i], bL[i], cL[i], dL[i])   # build once, share across features
                 for f in feats.values():
                     f.on_book(bev)
             else:
-                tev = TradeEvent(listing, tL[i], aL[i], bL[i], cL[i])
+                tev = TradeEvent(listing, rx, tL[i], aL[i], bL[i], cL[i])
                 for f in feats.values():
                     f.on_trade(tev)
             i += 1
@@ -464,11 +439,13 @@ def parity_check(
     while ai < na:                                          # trailing anchors after the last event
         read(ai); ai += 1
 
-    ref = {p: spec.vectorized(ctx, p) for p in params_list}
+    ref = {p: {k: hold_last(ctx.sample_to_anchor(v))       # sample onto the anchors, then hold-last (model view)
+               for k, v in spec.vectorized(ctx.raw_data, ctx.shared_data, ctx.config, p).items()}
+           for p in params_list}
     max_diff: dict = {}; n_points: dict = {}
     for p in params_list:
         for k in feats[p].keys:
-            s = streams[p][k]; r = ref[p][k][:na]
+            s = hold_last(streams[p][k]); r = ref[p][k][:na]   # both builds held the same way -> compare the model values
             both = np.isfinite(s) & np.isfinite(r)
             max_diff[(p, k)] = float(np.nanmax(np.abs(s[both] - r[both]))) if both.any() else float("nan")
             n_points[(p, k)] = int(both.sum())

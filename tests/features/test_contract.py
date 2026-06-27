@@ -7,8 +7,10 @@ import boba.features.ofi_ema                     # noqa: F401  (registers)
 import boba.features.ofi_fast_slow               # noqa: F401  (registers)
 import boba.features.price_dislocation           # noqa: F401  (registers)
 import boba.features.price_momentum              # noqa: F401  (registers)
+import boba.features.rate_momentum               # noqa: F401  (registers)
 import boba.features.stoikov_premium_fast_slow   # noqa: F401  (registers)
 import boba.features.trade_flow_imbalance        # noqa: F401  (registers)
+import boba.features.vol_momentum                # noqa: F401  (registers)
 from boba.features import base
 from boba.features.base import ParamKind
 
@@ -29,6 +31,8 @@ def test_every_registered_feature_declares_param_kind():
         "trade_flow_imbalance": ParamKind.SINGLE,
         "price_momentum": ParamKind.SINGLE,
         "flow_persistence": ParamKind.SINGLE,
+        "vol_momentum": ParamKind.FAST_SLOW,
+        "rate_momentum": ParamKind.FAST_SLOW,
     }
     for name, kind in expected.items():
         assert base.get(name).param_kind is kind, f"{name} param_kind mismatch"

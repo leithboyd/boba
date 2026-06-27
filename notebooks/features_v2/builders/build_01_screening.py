@@ -72,7 +72,7 @@ COUNTS  = (1, 3, 5)                                          # fixed mid-move-co
 ctx  = build_context(grid_ms=1, active_only=True, hours=24)  # 1 ms grid, keep only ms windows with an event (any venue); first 24 h
 spec = base.get(FEATURE)
 IS_2D = spec.param_kind == ParamKind.FAST_SLOW              # fast/slow grid vs single-span family
-KEYS = spec.keys_for(ctx, (1, 100) if IS_2D else 1)         # the feature's leg keys (per-exchange)
+KEYS = spec.keys_for(ctx.config, (1, 100) if IS_2D else 1)         # the feature's leg keys (per-exchange)
 print(f"{FEATURE}  ({spec.param_kind.value})   block {ctx.block}   legs {KEYS}")
 print(f"{len(ctx.merged_ts):,} trade ticks   {len(ctx.anchor_ts):,} grid anchors")
 """)

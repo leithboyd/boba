@@ -24,10 +24,10 @@ returns it; subsequent loads read the cache.
     no quantity columns, because the merge does not inform size (carrying the last
     snapshot's qty forward would be a stale-data trap). Schema: rx_time, bid_prc,
     ask_prc, bid_exchange_time, ask_exchange_time (one row per distinct rx event).
-    The two sides are fused INDEPENDENTLY (each newest-by-exchange_time), so the
-    stream can transiently CROSS — ask < bid on ~0.1-0.3% of rows (more where
-    trades update aggressively, e.g. bin). Consumers needing an uncrossed book must
-    clamp/skip those rows; do not assume ask >= bid.
+    The two sides are fused INDEPENDENTLY (each newest-by-exchange_time), which can momentarily CROSS
+    (ask < bid, ~0.15% of rows). The result is UN-CROSSED before return: where crossed, the side with
+    the newer exchange_time is trusted and the stale side is pushed one TICK past it (`tick_size`,
+    raising if the listing is not configured), so `ask >= bid` always holds.
 
 Known data quirks (consumers beware):
   * BBO (front_levels) cadence is venue-dependent. On eth_usdt_p, bin snapshots are
@@ -129,6 +129,36 @@ def _aggressor_inverted(listing: str) -> bool:
     return _venue_market(listing) in _AGGRESSOR_INVERTED
 
 
+# price tick (minimum increment) per listing — exchange reference data, kept in `tick_sizes.toml` at
+# the project root (verified from the data). Used e.g. to un-cross the merged book one tick from the
+# fresh side. `tick_size(listing)` looks it up (raising on an unconfigured listing).
+def _load_tick_sizes() -> dict:
+    import tomllib
+
+    from boba.settings import PROJECT_ROOT
+
+    path = PROJECT_ROOT / "tick_sizes.toml"
+    if not path.exists():
+        return {}
+    with path.open("rb") as f:
+        return tomllib.load(f).get("tick_size", {})
+
+
+_TICK_SIZES: dict = _load_tick_sizes()
+
+
+def tick_size(listing: str) -> float:
+    """The price tick (minimum increment) for `listing`, from `tick_sizes.toml`. Raises if the listing
+    is not configured — the tick is exchange reference data, so infer it from a block's `front_levels`
+    prices (`min` positive increment) and add it to the file rather than guessing at call time."""
+    try:
+        return _TICK_SIZES[listing]
+    except KeyError:
+        raise KeyError(
+            f"no tick_size configured for {listing!r}; add it to tick_sizes.toml (have {sorted(_TICK_SIZES)})"
+        ) from None
+
+
 def _merged_levels_blocked(listing: str) -> bool:
     # bin's PERP feed is sub-millisecond fresh, so the merge feeds a staler trade price
     # into a live quote and HURTS it (validated: next-snapshot R2 ~ -13). bin spot is
@@ -208,16 +238,19 @@ _I64MIN = np.iinfo(np.int64).min
 
 def _merge_side(snap_rx, snap_ex, snap_px, tr_rx, tr_ex, tr_px):
     """One price side of the merge: combine the side's BBO snapshot prices with its
-    relevant trades, in rx order, holding the price of the newest-by-exchange_time
-    event seen so far. Returns (rx_sorted, held_price, held_exchange_time)."""
+    relevant trades, in rx (then arrival-sequence) order, holding the price of the
+    newest-by-exchange_time event seen so far. On an exchange_time TIE the LATEST event
+    in sequence wins -- so a single aggressive order that sweeps several levels at one
+    exchange_time (its prints share it, arriving in order) resolves to its LAST/deepest
+    print, not its first (holding the first would understate the swept side and pull the
+    mid the wrong way). Returns (rx_sorted, held_price, held_exchange_time)."""
     rx = np.concatenate([snap_rx, tr_rx])
     ex = np.concatenate([snap_ex, tr_ex])
     px = np.concatenate([snap_px, tr_px])
-    o = np.argsort(rx, kind="stable")           # snapshots before trades on equal rx
+    o = np.argsort(rx, kind="stable")           # stable: snapshot before trade on equal rx; arrival order kept within ties
     rx, ex, px = rx[o], ex[o], px[o]
     run = np.maximum.accumulate(ex)
-    prev = np.empty_like(run); prev[0] = _I64MIN; prev[1:] = run[:-1]
-    pos = np.where(ex > prev, np.arange(len(ex)), -1)   # index where a strictly-newer exch arrived
+    pos = np.where(ex >= run, np.arange(len(ex)), -1)   # the LATEST event at the running-max exchange_time (ties -> last)
     held = np.maximum.accumulate(pos)                   # carry that index forward (>=0 from i=0)
     return rx, px[held], ex[held]
 
@@ -230,9 +263,22 @@ def _trade_lifts_ask(listing: str, agg: np.ndarray) -> np.ndarray:
     return (agg == "Ask") if _aggressor_inverted(listing) else (agg == "Bid")
 
 
+def _uncross_book(bid, ask, bid_ex, ask_ex, tick):
+    """Un-cross a fused book: where `ask < bid` (the two sides fused independently and crossed), TRUST the
+    side with the newer `exchange_time` and push the STALE side exactly one `tick` past it — the freshest
+    valid (non-crossed) book. Ties (`ask_ex == bid_ex`) treat the ask as fresher. Returns `(bid, ask)`.
+    The scalar online twin is `boba.features.streaming.uncross_quote` (parity-tied)."""
+    crossed = ask < bid
+    ask_fresher = ask_ex >= bid_ex                       # the side updated at least as recently is trusted
+    new_bid = np.where(crossed & ask_fresher, ask - tick, bid)
+    new_ask = np.where(crossed & ~ask_fresher, bid + tick, ask)
+    return new_bid, new_ask
+
+
 def _build_merged_levels(block: str, listing: str) -> pl.DataFrame:
     """Build the trade-augmented price stream (see module docstring). Price-only:
-    no quantity columns by design (the merge does not inform size)."""
+    no quantity columns by design (the merge does not inform size). The independently-fused sides can
+    cross, so the result is UN-CROSSED with the listing's tick (`tick_size`, raising if not configured)."""
     fl = (load_block(block, listing, "front_levels")
           .select("rx_time", "exchange_time", "bid_prc", "ask_prc")
           .drop_nulls().sort("rx_time"))
@@ -257,10 +303,11 @@ def _build_merged_levels(block: str, listing: str) -> pl.DataFrame:
     uniq = np.unique(all_rx[all_rx >= s_rx[0]])      # sorted unique; both sides defined since s_rx[0] feeds both
     ai = np.searchsorted(ask_rx, uniq, "right") - 1
     bi = np.searchsorted(bid_rx, uniq, "right") - 1
+    b, a = _uncross_book(bid_px[bi], ask_px[ai], bid_ex[bi], ask_ex[ai], tick_size(listing))
     return pl.DataFrame({
         "rx_time": uniq,
-        "bid_prc": bid_px[bi],
-        "ask_prc": ask_px[ai],
+        "bid_prc": b,
+        "ask_prc": a,
         "bid_exchange_time": bid_ex[bi],
         "ask_exchange_time": ask_ex[ai],
     }).with_columns(

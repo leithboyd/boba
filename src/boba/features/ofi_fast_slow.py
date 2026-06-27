@@ -17,8 +17,8 @@ RESEARCH. Cont, R., Kukanov, A. & Stoikov, S. (2014) 'The Price Impact of Order 
 of Financial Econometrics 12(1):47-88.
 
 Two implementations of the same maths, tied by `boba.research.screening.parity_check`:
-  - `vectorized(ctx, params)` -> {exchange -> feature vector on the grid}   (offline; reuses `ctx._flow_at`)
-  - `LiveOFIFastSlow`         -> the O(1) streaming build (two `KernelMeanEMA` E/W legs per venue)
+  - `vectorized(raw, shared, config, params)` -> {exchange -> (fast − slow) value per `shared.event_ts`}
+  - `LiveOFIFastSlow`                         -> the O(1) streaming build (two `KernelMeanEMA` E/W legs per venue)
 
 Mirror augmentation: OFI is signed order flow, ODD under the reflection of the tape through byb's mid
 (the bid/ask sides swap, so the increment negates — see `AUTHORING.md` → Mirror augmentation and the
@@ -31,43 +31,23 @@ from __future__ import annotations
 import numpy as np
 
 from boba.ema import KernelMeanEMA
-from boba.features.base import FeatureSpec, ParamKind, Params, register
-from boba.research.screening import ScreeningContext
+from boba.features._ofi import ofi_increment, ofi_leg
+from boba.features.base import Config, FeatureSpec, ParamKind, Params, RawData, SharedData, register
 
 
-def _ofi_stream(book: tuple) -> tuple[np.ndarray, np.ndarray]:
-    """`(rx, bid, bid_qty, ask, ask_qty)` raw front_levels rows -> `(ts, summed_increment)`: one path-sum
-    OFI sample per book-update timestamp. The CKS increment is formed for EVERY consecutive RAW row, then
-    increments sharing an rx_time are SUMMED into one sample (records at one ns are ONE flow event)."""
-    rx, bid, bq, ask, aq = book
-    pbp, pbq, pap, paq = bid[:-1], bq[:-1], ask[:-1], aq[:-1]     # previous raw row
-    cbp, cbq, cap, caq = bid[1:], bq[1:], ask[1:], aq[1:]         # current raw row
-    e = (np.where(cbp >= pbp, cbq, 0.0) - np.where(cbp <= pbp, pbq, 0.0)
-         - np.where(cap <= pap, caq, 0.0) + np.where(cap >= pap, paq, 0.0))
-    uniq, inv = np.unique(rx[1:], return_inverse=True)           # increments are stamped at the CUR row's rx
-    return uniq, np.bincount(inv, weights=e)                     # value = the full intra-ns path sum per ts
+def _ex(listing: str) -> str:
+    """The short exchange key (leg key) for a full listing id, e.g. 'byb_eth_usdt_p' -> 'byb'."""
+    return listing.split("_", 1)[0]
 
 
-def _leg(ctx: ScreeningContext, ofi_rx: np.ndarray, ofi_e: np.ndarray, span: int) -> np.ndarray:
-    """One OFI EMA leg read as `E/W` at each anchor: the OFI flow decayed once per trade-timestamp, read
-    live (committed-per-trade + the partial epoch of increments since the last trade)."""
-    E = ctx._flow_at(ctx.anchor_ts, ofi_e, span, src_rx=ofi_rx)
-    W = ctx._flow_at(ctx.anchor_ts, np.ones(ofi_e.size), span, src_rx=ofi_rx)
-    return E / np.where(W == 0.0, np.nan, W)
-
-
-def _exchanges(ctx: ScreeningContext) -> tuple[str, ...]:
-    """Every venue we build an OFI leg for: the target plus each foreign source (its OWN-book OFI)."""
-    return (ctx.target.split("_", 1)[0],) + tuple(ctx.sources)
-
-
-def vectorized(ctx: ScreeningContext, params: Params) -> dict[str, np.ndarray]:
-    """{exchange -> (fast − slow) E/W EMAs of that venue's path-sum OFI flow}, on the anchor grid (causal)."""
+def vectorized(raw: RawData, shared: SharedData, config: Config, params: Params) -> dict[str, np.ndarray]:
+    """{exchange -> (fast − slow) E/W EMAs of that venue's path-sum OFI flow}, one value per `event_ts` (causal)."""
     n_fast, n_slow = params
     out: dict[str, np.ndarray] = {}
-    for ex in _exchanges(ctx):
-        ofi_rx, ofi_e = _ofi_stream(ctx._books[ex])
-        out[ex] = _leg(ctx, ofi_rx, ofi_e, n_fast) - _leg(ctx, ofi_rx, ofi_e, n_slow)
+    for l in config.all_listings:
+        front = raw.listings[l].front_levels
+        out[_ex(l)] = (ofi_leg(front, shared.clock, shared.event_ts, n_fast)
+                       - ofi_leg(front, shared.clock, shared.event_ts, n_slow))
     return out
 
 
@@ -76,13 +56,11 @@ class LiveOFIFastSlow:
     own path-sum OFI flow + its previous raw row; each book row accumulates one CKS increment, `refresh()`
     injects each venue's SUMMED increment, then decays all legs once iff a trade landed (shared clock)."""
 
-    def __init__(self, ctx: ScreeningContext, params: Params):
+    def __init__(self, config: Config, params: Params):
         n_fast, n_slow = params
-        coin = ctx.coin
-        self.exes = _exchanges(ctx)
+        self.exes = tuple(_ex(l) for l in config.all_listings)
         self.keys = self.exes
-        self._key_of = {f"{ex}_{coin}": ex for ex in self.exes}   # full listing -> short key
-        self.fuse_trades = frozenset()                    # OFI is book-only — no trade fusion
+        self._key_of = {l: _ex(l) for l in config.all_listings}   # full listing -> short key
         self.leg_f = {ex: KernelMeanEMA(n_fast) for ex in self.exes}
         self.leg_s = {ex: KernelMeanEMA(n_slow) for ex in self.exes}
         self.prev = {ex: None for ex in self.exes}        # previous raw (bid, bid_qty, ask, ask_qty) per venue
@@ -97,10 +75,8 @@ class LiveOFIFastSlow:
         bid, bq, ask, aq = ev.bid, ev.bid_qty, ev.ask, ev.ask_qty
         p = self.prev[ex]
         if p is not None:
-            pb, pq, pa, paq = p
-            e = ((bq if bid >= pb else 0.0) - (pq if bid <= pb else 0.0)
-                 - (aq if ask <= pa else 0.0) + (paq if ask >= pa else 0.0))
-            self.ts_e[ex] += e; self.ts_got[ex] = True
+            self.ts_e[ex] += ofi_increment(*p, bid, bq, ask, aq)   # scalar twin of ofi_stream
+            self.ts_got[ex] = True
         self.prev[ex] = (bid, bq, ask, aq)
 
     def on_trade(self, ev) -> None:                       # any venue's trade -> just flag the timestamp (OFI is book-only)
@@ -127,8 +103,8 @@ class LiveOFIFastSlow:
 SPEC = FeatureSpec(
     name="ofi_fast_slow",
     vectorized=vectorized,
-    make_streaming=lambda ctx, params: LiveOFIFastSlow(ctx, params),
-    keys_for=lambda ctx, params: (ctx.target.split("_", 1)[0],) + tuple(ctx.sources),
+    make_streaming=lambda config, params: LiveOFIFastSlow(config, params),
+    keys_for=lambda config, params: tuple(_ex(l) for l in config.all_listings),
     mirror=np.negative,   # signed order flow: reflecting the book swaps bid/ask -> the OFI increment negates
     param_kind=ParamKind.FAST_SLOW,                          # params = (n_fast, n_slow)
 )

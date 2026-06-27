@@ -14,8 +14,8 @@ Hayashi, T. & Yoshida, N. (2005) 'On covariance estimation of non-synchronously 
 processes', Bernoulli 11(2):359-379 (cross-venue lead-lag).
 
 Two implementations of the same maths, tied by `boba.research.screening.parity_check`:
-  - `vectorized(ctx, params)` -> {source -> feature vector on the grid}   (offline, may use lfilter)
-  - `LiveDislocation`         -> the O(1) streaming build (composes `LiveYardstick` for σ_ev)
+  - `vectorized(raw, shared, config, params)` -> {source -> feature vector per `event_ts`}  (offline; lfilter)
+  - `LiveDislocation`                         -> the O(1) streaming build (composes `VolYardstick` for σ_ev)
 
 Mirror augmentation: the feature is ODD under the reflection of the tape through byb's mid, so `SPEC.mirror`
 is `np.negative` (see the SPEC comment below and `AUTHORING.md` → Mirror augmentation).
@@ -25,13 +25,19 @@ See `AUTHORING.md` (this directory) for the EMA-type and inject/decay rules thes
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import numpy as np
 
 from boba.ema import LiveFrontEMA
-from boba.features.base import FeatureSpec, ParamKind, Params, register
-from boba.research.screening import LiveYardstick, ScreeningContext
+from boba.features.base import Config, FeatureSpec, ParamKind, Params, RawData, SharedData
+from boba.features.base import register
+from boba.features.shared import _ffill
+from boba.features.streaming import LiveMergedBook, VolYardstick
+
+
+def _ex(listing: str) -> str:
+    """The short exchange key (leg key) for a full listing id, e.g. 'bin_eth_usdt_p' -> 'bin'."""
+    return listing.split("_", 1)[0]
 
 
 def _ema(gap: np.ndarray, span: int) -> np.ndarray:
@@ -44,76 +50,73 @@ def _ema(gap: np.ndarray, span: int) -> np.ndarray:
     return lfilter([a], [1.0, -(1.0 - a)], gap)
 
 
-def vectorized(ctx: ScreeningContext, params: Params) -> dict[str, np.ndarray]:
-    """{source -> (fast − slow live-front EMA of the log gap) / σ_ev}, on the anchor grid (causal)."""
-    n_fast, n_slow = params
+def _dislocation_leg(src_mid, target_logmid_clock: np.ndarray, target_logmid_event: np.ndarray,
+                     clock: np.ndarray, event_ts: np.ndarray, tick_at_event: np.ndarray,
+                     n_fast: int, n_slow: int, sigma: np.ndarray) -> np.ndarray:
+    """One source's `(fast − slow live-front EMA of the log gap) / σ_ev` at every `event_ts` (causal).
+
+    The committed leg is the trade-clock EMA of the gap `g = log(mid_src) − log(mid_target)` read at each
+    event-grid timestamp's tick; the live front adds the freshest gap AT the event timestamp:
+    `(1−α)·committed[tick] + α·g_fresh`. `g_fresh` is NaN where either side has not quoted -> the leg is
+    NaN there. The committed EMA uses the gap forward-filled on the trade clock (a missing mid contributes
+    a 0 gap, matching the old `nan_to_num`); the σ_ev divide carries the regime scale out."""
     af, as_ = 2.0 / (n_fast + 1.0), 2.0 / (n_slow + 1.0)
-    target_ex = ctx.target.split("_", 1)[0]
-    log_mid_target_clock = ctx.target_logmid_on_clock
-    g_fresh_target = np.log(ctx.mid_at_anchor(target_ex))
-    out: dict[str, np.ndarray] = {}
-    for ex in ctx.sources:
-        g_committed = np.nan_to_num(np.log(ctx.mid_on_clock(ex)) - log_mid_target_clock, nan=0.0)
-        g_fresh = np.log(ctx.mid_at_anchor(ex)) - g_fresh_target
-        fast = (1.0 - af) * _ema(g_committed, n_fast)[ctx.tick_at_anchor] + af * g_fresh
-        slow = (1.0 - as_) * _ema(g_committed, n_slow)[ctx.tick_at_anchor] + as_ * g_fresh
-        out[ex] = (fast - slow) / ctx.sigma_at_anchor
-    return out
+    g_committed = np.nan_to_num(np.log(_ffill(src_mid.rx, src_mid.value, clock)) - target_logmid_clock, nan=0.0)
+    g_fresh = np.log(_ffill(src_mid.rx, src_mid.value, event_ts)) - target_logmid_event
+    fast = (1.0 - af) * _ema(g_committed, n_fast)[tick_at_event] + af * g_fresh
+    slow = (1.0 - as_) * _ema(g_committed, n_slow)[tick_at_event] + as_ * g_fresh
+    return (fast - slow) / sigma
+
+
+def vectorized(raw: RawData, shared: SharedData, config: Config, params: Params) -> dict[str, np.ndarray]:
+    """{source -> (fast − slow live-front EMA of the log gap) / σ_ev}, one value per `event_ts` (causal)."""
+    n_fast, n_slow = params
+    target_mid = shared.listings[config.target_listing].mid
+    target_logmid_clock = np.log(_ffill(target_mid.rx, target_mid.value, shared.clock))
+    target_logmid_event = np.log(_ffill(target_mid.rx, target_mid.value, shared.event_ts))
+    tick_at_event = np.searchsorted(shared.clock, shared.event_ts, "right") - 1
+    sigma = np.where(shared.vol_yardstick == 0.0, np.nan, shared.vol_yardstick)   # σ_ev=0 only in warm-up -> clean NaN, not inf
+    return {_ex(l): _dislocation_leg(shared.listings[l].mid, target_logmid_clock, target_logmid_event,
+                                     shared.clock, shared.event_ts, tick_at_event, n_fast, n_slow, sigma)
+            for l in config.other_listings}
 
 
 class LiveDislocation:
-    """O(1) streaming build. σ_ev via the shared `LiveYardstick`; each gap leg a `LiveFrontEMA`
+    """O(1) streaming build. σ_ev via the shared `VolYardstick`; each gap leg a `LiveFrontEMA`
     (live-front level read). Driver applies events then calls `refresh()` once per timestamp."""
 
-    def __init__(self, ctx: ScreeningContext, params: Params):
+    def __init__(self, config: Config, params: Params):
         n_fast, n_slow = params
-        target_ex = ctx.target.split("_", 1)[0]
-        self.target = ctx.target
-        self.others = [f"{s}_{ctx.coin}" for s in ctx.sources]
-        self.keys = tuple(ctx.sources)
-        self._key_of = {f"{s}_{ctx.coin}": s for s in ctx.sources}
-        self.fuse_trades = frozenset(
-            f"{ex}_{ctx.coin}" for ex in (target_ex,) + tuple(ctx.sources)
-            if ctx.mid_stream[ex] == "merged_levels")
-        self.bid: dict = {}; self.bid_t: dict = {}; self.ask: dict = {}; self.ask_t: dict = {}
-        self.yard = LiveYardstick(ctx.yardstick_span)
+        self.target = config.target_listing
+        self.others = list(config.other_listings)
+        self.keys = tuple(_ex(o) for o in self.others)
+        self._key_of = {o: _ex(o) for o in self.others}
+        fuse_tick = {l: config.tick_size[l] for l in config.all_listings
+                     if config.mid_stream.get(l) == "merged_levels"}     # KeyError -> no tick for a fused listing
+        self.book = LiveMergedBook(fuse_tick)        # shared merged-book reconstruction (fuse + un-cross); read .quote()
+        self.yard = VolYardstick(config.yardstick_span)
         self.leg_f = {o: LiveFrontEMA(n_fast) for o in self.others}
         self.leg_s = {o: LiveFrontEMA(n_slow) for o in self.others}
         self.was_trade_present = False
 
-    def _side(self, listing: str, is_ask, px: float, t: int) -> None:
-        held_t = self.ask_t if is_ask else self.bid_t
-        if t > held_t.get(listing, -1):
-            (self.ask if is_ask else self.bid)[listing] = px
-            held_t[listing] = t
-
-    def _mid(self, listing: str) -> Optional[float]:
-        b, a = self.bid.get(listing), self.ask.get(listing)
-        return None if b is None or a is None else 0.5 * (b + a)
-
-    def on_book(self, ev) -> None:                  # uses only prices; sizes (ev.bid_qty/ask_qty) ignored
-        listing = ev.listing
-        if listing in self.fuse_trades:
-            self._side(listing, False, ev.bid, ev.exch_time); self._side(listing, True, ev.ask, ev.exch_time)
-        else:
-            self.bid[listing] = ev.bid; self.ask[listing] = ev.ask
+    def on_book(self, ev) -> None:
+        self.book.on_book(ev)
 
     def on_trade(self, ev) -> None:
-        if ev.listing in self.fuse_trades:
-            self._side(ev.listing, ev.lifts_ask, ev.px, ev.exch_time)
+        self.book.on_trade(ev)
         self.was_trade_present = True
 
     def refresh(self) -> None:
         traded, self.was_trade_present = self.was_trade_present, False
-        tgt = self._mid(self.target)
-        if tgt is None:
+        q = self.book.quote(self.target)
+        if q is None:
             return
-        lt = math.log(tgt)
+        lt = math.log(0.5 * (q[0] + q[1]))          # mid from the un-crossed (bid, ask)
         self.yard.on_target_logmid(lt)              # injects (Δlog)^2 iff the target moved
         for o in self.others:
-            m = self._mid(o)
-            if m is not None:
-                g = math.log(m) - lt
+            qo = self.book.quote(o)
+            if qo is not None:
+                g = math.log(0.5 * (qo[0] + qo[1])) - lt
                 self.leg_f[o].add(g); self.leg_s[o].add(g)   # refresh the live front
         if traded:                                  # advance the clock once: decay σ_ev, commit each leg
             self.yard.tick()
@@ -128,8 +131,8 @@ class LiveDislocation:
 SPEC = FeatureSpec(
     name="price_dislocation",
     vectorized=vectorized,
-    make_streaming=lambda ctx, params: LiveDislocation(ctx, params),
-    keys_for=lambda ctx, params: tuple(ctx.sources),
+    make_streaming=lambda config, params: LiveDislocation(config, params),
+    keys_for=lambda config, params: tuple(_ex(l) for l in config.other_listings),
     param_kind=ParamKind.FAST_SLOW,                          # params = (n_fast, n_slow)
     # Mirror augmentation: reflecting the tape through byb's mid negates this feature. The legs are linear
     # in the log gap and the gap is a price-DIFFERENCE (the reflection level cancels), so gap -> -gap and

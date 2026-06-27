@@ -20,8 +20,8 @@ Reference: Stoikov, S. (2018) 'The Micro-Price: A High-Frequency Estimator of Fu
 Quantitative Finance 18(12):1959-1966 (SSRN 2970694); Gatheral, J. & Oomen, R. (size-weighted mid).
 
 Two implementations of the same maths, tied by `boba.research.screening.parity_check`:
-  - `vectorized(ctx, params)` -> {exchange -> feature vector on the grid}   (offline; may use lfilter)
-  - `LiveStoikovPremiumFastSlow` -> O(1) streaming build (two `LiveFrontEMA` legs per venue)
+  - `vectorized(raw, shared, config, params)` -> {exchange -> fast-slow per `shared.event_ts`}  (offline)
+  - `LiveStoikovPremiumFastSlow`               -> O(1) streaming build (two `LiveFrontEMA` legs per venue)
 
 Mirror augmentation: the premium is ODD under book reflection. The reflected book swaps bid/ask and
 their sizes, so `(microprice - mid) / mid` negates exactly. Therefore `SPEC.mirror` is `np.negative`.
@@ -35,79 +35,69 @@ import math
 import numpy as np
 
 from boba.ema import LiveFrontEMA
-from boba.features.base import FeatureSpec, ParamKind, Params, register
-from boba.research.screening import ScreeningContext
+from boba.features.base import Config, FeatureSpec, FrontLevels, ParamKind, Params, RawData, SharedData, register
+from boba.features.shared import _ffill
 
 
-def _exchanges(ctx: ScreeningContext) -> tuple[str, ...]:
-    """Every venue we build a premium leg for: the target plus each foreign source."""
-    return (ctx.target.split("_", 1)[0],) + tuple(ctx.sources)
+def _ex(listing: str) -> str:
+    """The short exchange key (leg key) for a full listing id, e.g. 'byb_eth_usdt_p' -> 'byb'."""
+    return listing.split("_", 1)[0]
 
 
-def _premium_stream(book: tuple) -> tuple[np.ndarray, np.ndarray]:
-    """Raw `(rx, bid, bid_qty, ask, ask_qty)` rows -> valid `(rx, premium)` level stream.
-
-    The premium needs both prices and both side sizes. Rows with non-positive or non-finite inputs are
-    ignored, so they do not overwrite the previous valid level in either build.
-    """
-    rx, bid, bq, ask, aq = book
+def _premium_stream(front: FrontLevels) -> tuple[np.ndarray, np.ndarray]:
+    """`front_levels` rows -> valid `(rx, premium)` LEVEL stream. The premium needs both prices and both
+    side sizes; rows with non-positive or non-finite inputs are dropped so they never overwrite the
+    previous valid level in either build."""
+    rx, bid, bq, ask, aq = front.rx, front.bid, front.bid_qty, front.ask, front.ask_qty
     ok = ((bid > 0.0) & (ask > 0.0) & (bq > 0.0) & (aq > 0.0)
           & np.isfinite(bid) & np.isfinite(ask) & np.isfinite(bq) & np.isfinite(aq))
     if not np.any(ok):
-        return rx[:0], bid[:0].astype(float)
+        return rx[:0].astype(np.int64), bid[:0].astype(float)
     bid, bq, ask, aq = bid[ok], bq[ok], ask[ok], aq[ok]
     mid = 0.5 * (bid + ask)
     micro = (bq * ask + aq * bid) / (bq + aq)
-    return rx[ok], (micro - mid) / mid
+    return np.asarray(rx[ok], np.int64), (micro - mid) / mid
 
 
-def _ffill(rx: np.ndarray, val: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Causal forward-fill with NaN before the first valid source row."""
-    out = np.full(len(t), np.nan)
-    if len(rx) == 0:
+def _live_front_at(rx: np.ndarray, prem: np.ndarray, clock: np.ndarray, event_ts: np.ndarray,
+                   span: int) -> np.ndarray:
+    """`LiveFrontEMA(span)` of the premium LEVEL, read live at every `event_ts`: the committed EMA on the
+    decay `clock` (the premium ffilled/sampled to the clock) carried one step toward the fresh premium
+    at `event_ts`. `fast = (1-a)*committed[tick_at_event] + a*fresh`, with `tick_at_event` the last clock
+    tick at-or-before each event_ts. NaN before the first commit / first valid level (warm-up)."""
+    out = np.full(len(event_ts), np.nan)
+    if len(rx) == 0 or len(clock) == 0 or len(event_ts) == 0:
         return out
-    idx = np.searchsorted(rx, t, "right") - 1
-    ok = idx >= 0
-    out[ok] = val[idx[ok]]
-    return out
-
-
-def _ema(x: np.ndarray, span: int) -> np.ndarray:
-    """Offline trade-clock EMA of a level sampled on the trade clock."""
-    if span == 1:
-        return x
-    a = 2.0 / (span + 1.0)
-    try:
-        from scipy.signal import lfilter
-    except ModuleNotFoundError:
-        out = np.empty_like(x, dtype=float)
-        ema = 0.0
-        for i, v in enumerate(x):
-            ema = (1.0 - a) * ema + a * v
-            out[i] = ema
-        return out
-    return lfilter([a], [1.0, -(1.0 - a)], x)
-
-
-def _live_front_at(ctx: ScreeningContext, rx: np.ndarray, prem: np.ndarray, span: int) -> np.ndarray:
-    """`LiveFrontEMA(span)` for the premium stream, read at each anchor."""
-    out = np.full(len(ctx.anchor_ts), np.nan)
-    if len(rx) == 0 or len(ctx.merged_ts) == 0 or len(ctx.anchor_ts) == 0:
-        return out
+    from scipy.signal import lfilter
 
     a = 2.0 / (span + 1.0)
-    prem_on_clock = np.nan_to_num(_ffill(rx, prem, ctx.merged_ts), nan=0.0)
-    fresh = _ffill(rx, prem, ctx.anchor_ts)
-    tick = ctx.tick_at_anchor
-    tick_ok = tick >= 0
-    first_commit = np.searchsorted(ctx.merged_ts, rx[0], "left")
-    started = tick_ok & (tick >= first_commit) & (first_commit < len(ctx.merged_ts))
+    prem_on_clock = np.nan_to_num(_ffill(rx, prem, clock), nan=0.0)      # premium sampled to the clock
+    fresh = _ffill(rx, prem, event_ts)                                   # freshest premium at each event_ts
+    committed = prem_on_clock if span == 1 else lfilter([a], [1.0, -(1.0 - a)], prem_on_clock)
+
+    tick = np.searchsorted(clock, event_ts, "right") - 1                 # last clock tick <= each event_ts
+    first_commit = np.searchsorted(clock, rx[0], "left")                 # first tick that sees a premium
+    started = (tick >= 0) & (tick >= first_commit) & (first_commit < len(clock))
     if not np.any(started):
         return out
-
-    committed = _ema(prem_on_clock, span)
     out[started] = (1.0 - a) * committed[tick[started]] + a * fresh[started]
     return out
+
+
+def _premium_leg(front: FrontLevels, clock: np.ndarray, event_ts: np.ndarray,
+                 n_fast: int, n_slow: int) -> np.ndarray:
+    """One venue's fast-slow size-weighted-mid premium oscillator, read live at every `event_ts`: two
+    `LiveFrontEMA` legs (fast, slow) over that venue's premium LEVEL, returned as `fast - slow`."""
+    rx, prem = _premium_stream(front)
+    return (_live_front_at(rx, prem, clock, event_ts, n_fast)
+            - _live_front_at(rx, prem, clock, event_ts, n_slow))
+
+
+def vectorized(raw: RawData, shared: SharedData, config: Config, params: Params) -> dict[str, np.ndarray]:
+    """{exchange -> fast - slow `LiveFrontEMA` of that venue's Stoikov premium}, one value per `event_ts`."""
+    n_fast, n_slow = params
+    return {_ex(l): _premium_leg(raw.listings[l].front_levels, shared.clock, shared.event_ts, n_fast, n_slow)
+            for l in config.all_listings}
 
 
 def _premium_scalar(bid: float, bq: float, ask: float, aq: float) -> float | None:
@@ -121,16 +111,6 @@ def _premium_scalar(bid: float, bq: float, ask: float, aq: float) -> float | Non
     return (micro - mid) / mid
 
 
-def vectorized(ctx: ScreeningContext, params: Params) -> dict[str, np.ndarray]:
-    """{exchange -> fast - slow `LiveFrontEMA` of that venue's Stoikov premium}, on the anchor grid."""
-    n_fast, n_slow = params
-    out: dict[str, np.ndarray] = {}
-    for ex in _exchanges(ctx):
-        rx, prem = _premium_stream(ctx._books[ex])
-        out[ex] = _live_front_at(ctx, rx, prem, n_fast) - _live_front_at(ctx, rx, prem, n_slow)
-    return out
-
-
 class LiveStoikovPremiumFastSlow:
     """O(1) streaming build, one premium oscillator per venue.
 
@@ -138,13 +118,11 @@ class LiveStoikovPremiumFastSlow:
     venue, then decays/commits both legs once iff a trade landed on the shared clock.
     """
 
-    def __init__(self, ctx: ScreeningContext, params: Params):
+    def __init__(self, config: Config, params: Params):
         n_fast, n_slow = params
-        coin = ctx.coin
-        self.exes = _exchanges(ctx)
+        self.exes = tuple(_ex(l) for l in config.all_listings)
         self.keys = self.exes
-        self._key_of = {f"{ex}_{coin}": ex for ex in self.exes}
-        self.fuse_trades = frozenset()                    # premium needs raw book sizes; trades do not refresh it
+        self._key_of = {l: _ex(l) for l in config.all_listings}   # full listing -> short key
         self.leg_f = {ex: LiveFrontEMA(n_fast) for ex in self.exes}
         self.leg_s = {ex: LiveFrontEMA(n_slow) for ex in self.exes}
         self.ts_prem = {ex: 0.0 for ex in self.exes}
@@ -187,8 +165,8 @@ class LiveStoikovPremiumFastSlow:
 SPEC = FeatureSpec(
     name="stoikov_premium_fast_slow",
     vectorized=vectorized,
-    make_streaming=lambda ctx, params: LiveStoikovPremiumFastSlow(ctx, params),
-    keys_for=lambda ctx, params: (ctx.target.split("_", 1)[0],) + tuple(ctx.sources),
+    make_streaming=lambda config, params: LiveStoikovPremiumFastSlow(config, params),
+    keys_for=lambda config, params: tuple(_ex(l) for l in config.all_listings),
     mirror=np.negative,                                      # bid/ask + sizes swap under reflection -> premium negates
     param_kind=ParamKind.FAST_SLOW,                          # params = (n_fast, n_slow)
 )

@@ -1,0 +1,34 @@
+# Price tick size (minimum price increment) per listing.
+#
+# Keyed by the full listing token `{venue}_{coin}_usdt[_p]` (the same token `boba.io` uses; the
+# trailing `_p` marks a perp, no suffix marks spot). Loaded by `boba.io.tick_size(listing)`.
+#
+# VERIFIED FROM THE DATA three independent ways (see tests/test_io_merged_levels.py):
+#   (1) every front_levels bid/ask PRICE is an integer multiple of the tick (all quotes on the grid),
+#   (2) the tick == the minimum gap between distinct prices (the finest resolution observed),
+#   (3) the tick == the minimum positive bid-ask SPREAD (the book reaches exactly one tick wide).
+# For ETH all three agree on $0.01 (the book is 1-tick-wide ~99% of the time). To add a listing:
+#
+#     import numpy as np, boba.io as io
+#     fl = io.load_block(io.list_blocks(L, "front_levels")[0], L, "front_levels").select("bid_prc","ask_prc").drop_nulls()
+#     px = np.unique(np.concatenate([fl["bid_prc"].to_numpy(), fl["ask_prc"].to_numpy()]))
+#     tick = np.diff(np.sort(px))[np.diff(np.sort(px)) > 0].min()   # then confirm np.all(px/tick ≈ round) and min spread
+#
+# Used (e.g.) to un-cross the merged_levels book: clamp the stale side one tick from the fresh side.
+
+[tick_size]
+# ETH-USDT — spot + perp, all venues: $0.01 across the board (verified, 100% on-grid).
+byb_eth_usdt_p = 0.01    # bybit   ETH-USDT perp
+byb_eth_usdt   = 0.01    # bybit   ETH-USDT spot
+bin_eth_usdt_p = 0.01    # binance ETH-USDT perp
+bin_eth_usdt   = 0.01    # binance ETH-USDT spot
+okx_eth_usdt_p = 0.01    # okx     ETH-USDT perp
+okx_eth_usdt   = 0.01    # okx     ETH-USDT spot
+
+# BTC-USDT — $0.1 everywhere EXCEPT binance SPOT, which is finer at $0.01 (verified, all three ways).
+byb_btc_usdt_p = 0.1     # bybit   BTC-USDT perp
+byb_btc_usdt   = 0.1     # bybit   BTC-USDT spot
+bin_btc_usdt_p = 0.1     # binance BTC-USDT perp
+bin_btc_usdt   = 0.01    # binance BTC-USDT spot  (finer tick than the rest)
+okx_btc_usdt_p = 0.1     # okx     BTC-USDT perp
+okx_btc_usdt   = 0.1     # okx     BTC-USDT spot
