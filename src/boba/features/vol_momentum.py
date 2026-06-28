@@ -1,24 +1,26 @@
-"""`vol_momentum` — log-ratio of a FAST to a SLOW volatility yardstick (the target's vol acceleration).
+"""`vol_momentum` — log-ratio of a FAST to a SLOW volatility yardstick (per-venue vol acceleration).
 
-WHAT it measures. The target's `σ_ev` (RMS mid-move per move) at a fast span over `σ_ev` at a slow span, in
-logs: `log(σ_ev_fast / σ_ev_slow)`. A single target-based leg. `params = (n_fast, n_slow)`. Positive =
-short-horizon vol running ABOVE its slower baseline (vol picking up); negative = vol cooling off.
+WHAT it measures. For EACH venue, that venue's own `σ_ev` (RMS mid-move per move) at a fast span over `σ_ev`
+at a slow span, in logs: `log(σ_ev_fast / σ_ev_slow)`. It **fans out over every listing** (`config.all_listings`
+— the target plus each source), one leg per venue built from that venue's OWN mid; `params = (n_fast, n_slow)`.
+Positive = short-horizon vol running ABOVE its slower baseline (vol picking up); negative = vol cooling off.
+(To restrict to the target alone, pass a `config` whose `other_listings` is empty.)
 
 WHY it might predict (falsifiable). Volatility clusters, and the clustering builds and decays — a fast-vs-slow
-σ_ev ratio is the canonical vol-of-vol / vol-acceleration coordinate. The hypothesis is that vol momentum
-leads byb's near-term realised-vol regime, and through it the SCALE of the next move (a |move| / squared-return
-target), not its direction. FALSIFIED if the ratio carries no forward information about byb's realised vol
-beyond the slow level itself (a flat IC vs the vol target).
+σ_ev ratio is the canonical vol-of-vol / vol-acceleration coordinate. The hypothesis is that a venue's vol
+momentum (especially a faster source's, ahead of byb) leads byb's near-term realised-vol regime, and through
+it the SCALE of the next move (a |move| / squared-return target), not its direction. FALSIFIED if no leg
+carries forward information about byb's realised vol beyond the slow level itself.
 
 RESEARCH. Corsi, F. (2009) 'A Simple Approximate Long-Memory Model of Realized Volatility', Journal of
 Financial Econometrics 7(2):174-196 (HAR-RV: a fast vs slow realised-vol decomposition); Engle, R. (1982)
 'Autoregressive Conditional Heteroscedasticity', Econometrica 50(4):987-1007 (volatility clustering).
 
 Two implementations of the same maths, tied by `boba.research.screening.parity_check`:
-  - `vectorized(raw, shared, config, (n_fast, n_slow))` -> {target -> log(σ_ev_fast/σ_ev_slow) per `event_ts`}
-  - `LiveVolMomentum` -> two composed `VolYardstick`s (fast, slow); `value = log(fast.sigma()/slow.sigma())`
+  - `vectorized(raw, shared, config, (n_fast, n_slow))` -> {venue -> log(σ_ev_fast/σ_ev_slow) per `event_ts`}
+  - `LiveVolMomentum` -> two composed `VolYardstick`s (fast, slow) per venue; `value = log(fast.sigma()/slow.sigma())`
 
-Mirror augmentation: `σ_ev` is built from SQUARED target moves, so it is EVEN under the reflection of the tape
+Mirror augmentation: `σ_ev` is built from SQUARED moves, so it is EVEN under the reflection of the tape
 through byb's mid; a ratio of two even quantities is even -> the feature is EVEN -> `SPEC.mirror` is the
 identity (the reflection leaves it unchanged).
 
@@ -53,29 +55,34 @@ def _log_ratio(fast: np.ndarray, slow: np.ndarray) -> np.ndarray:
 
 
 def vectorized(raw: RawData, shared: SharedData, config: Config, params: Params) -> dict[str, np.ndarray]:
-    """{target -> log(σ_ev_fast / σ_ev_slow)} at every `event_ts` (causal); NaN until both yardsticks warm up."""
+    """{venue -> log(σ_ev_fast / σ_ev_slow)} from each venue's OWN mid-moves, one value per `event_ts`
+    (causal); NaN until both yardsticks warm up. Fans out over `config.all_listings`."""
     n_fast, n_slow = params
-    target_mid = shared.listings[config.target_listing].mid
-    sig_fast, _ = _yardsticks(target_mid, shared.clock, shared.event_ts, n_fast)
-    sig_slow, _ = _yardsticks(target_mid, shared.clock, shared.event_ts, n_slow)
-    return {_ex(config.target_listing): _log_ratio(sig_fast, sig_slow)}
+    out: dict[str, np.ndarray] = {}
+    for l in config.all_listings:
+        mid = shared.listings[l].mid
+        sig_fast, _ = _yardsticks(mid, shared.clock, shared.event_ts, n_fast)
+        sig_slow, _ = _yardsticks(mid, shared.clock, shared.event_ts, n_slow)
+        out[_ex(l)] = _log_ratio(sig_fast, sig_slow)
+    return out
 
 
 class LiveVolMomentum:
-    """O(1) streaming build: two composed `VolYardstick`s (fast, slow) on the TARGET mid. The target mid
-    follows its mid policy via `LiveMergedBook` (book-only or trade-fused + un-crossed). `refresh()` feeds
-    the target log-mid to both yardsticks, then decays both once iff a trade landed (shared clock). One leg."""
+    """O(1) streaming build, ONE leg per venue (fans out over `config.all_listings`). Each venue carries two
+    `VolYardstick`s (fast, slow) over its OWN mid; the mid follows that venue's mid policy via the shared
+    `LiveMergedBook`. `refresh()` feeds each venue's log-mid to its two yardsticks, then decays all of them
+    once iff a trade landed (shared clock)."""
 
     def __init__(self, config: Config, params: Params):
         n_fast, n_slow = params
-        self.target = config.target_listing
-        self.key = _ex(self.target)
-        self.keys = (self.key,)
+        self.listings = list(config.all_listings)
+        self.keys = tuple(_ex(l) for l in self.listings)
+        self._key_of = {l: _ex(l) for l in self.listings}
         fuse_tick = {l: config.tick_size[l] for l in config.all_listings
                      if config.mid_stream.get(l) == "merged_levels"}     # KeyError -> no tick for a fused listing
         self.book = LiveMergedBook(fuse_tick)        # shared merged-book reconstruction (fuse + un-cross); read .quote()
-        self.fast = VolYardstick(n_fast)
-        self.slow = VolYardstick(n_slow)
+        self.fast = {l: VolYardstick(n_fast) for l in self.listings}
+        self.slow = {l: VolYardstick(n_slow) for l in self.listings}
         self.was_trade_present = False
 
     def on_book(self, ev) -> None:
@@ -87,29 +94,34 @@ class LiveVolMomentum:
 
     def refresh(self) -> None:
         traded, self.was_trade_present = self.was_trade_present, False
-        q = self.book.quote(self.target)
-        lt = None
-        if q is not None:
-            mid = 0.5 * (q[0] + q[1])
-            if mid > 0.0:
-                lt = math.log(mid)
-        self.fast.on_target_logmid(lt)               # injects (Δlog)^2 into each iff the target moved
-        self.slow.on_target_logmid(lt)
+        for l in self.listings:
+            q = self.book.quote(l)
+            lt = None
+            if q is not None:
+                mid = 0.5 * (q[0] + q[1])
+                if mid > 0.0:
+                    lt = math.log(mid)
+            self.fast[l].on_target_logmid(lt)        # injects (Δlog)^2 into each iff this venue's mid moved
+            self.slow[l].on_target_logmid(lt)
         if traded:
-            self.fast.tick()
-            self.slow.tick()
+            for l in self.listings:
+                self.fast[l].tick()
+                self.slow[l].tick()
 
     def value(self) -> dict[str, float]:
-        sf, ss = self.fast.sigma(), self.slow.sigma()
-        ok = sf > 0.0 and ss > 0.0 and math.isfinite(sf) and math.isfinite(ss)
-        return {self.key: math.log(sf / ss) if ok else float("nan")}
+        out: dict[str, float] = {}
+        for l in self.listings:
+            sf, ss = self.fast[l].sigma(), self.slow[l].sigma()
+            ok = sf > 0.0 and ss > 0.0 and math.isfinite(sf) and math.isfinite(ss)
+            out[self._key_of[l]] = math.log(sf / ss) if ok else float("nan")
+        return out
 
 
 SPEC = FeatureSpec(
     name="vol_momentum",
     vectorized=vectorized,
     make_streaming=lambda config, params: LiveVolMomentum(config, params),
-    keys_for=lambda config, params: (_ex(config.target_listing),),
+    keys_for=lambda config, params: tuple(_ex(l) for l in config.all_listings),
     mirror=_identity,   # σ_ev is built from SQUARED moves (even); a ratio of two even quantities is EVEN
     param_kind=ParamKind.FAST_SLOW,                          # params = (n_fast, n_slow)
 )

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import numpy as np
@@ -308,8 +308,9 @@ def build_context(
     ctx.vol_level = np.log(ctx.sigma_at_anchor)
     ctx.rate_level = np.log(ctx.lam_at_anchor)
     spans = (yardstick_span // 10, yardstick_span)        # (fast, slow)
-    vm = _vol_momentum_vec(raw_data, shared_data, config, spans)[target_ex]
-    rm = _rate_momentum_vec(raw_data, shared_data, config, spans)[target_ex]
+    tgt_only = replace(config, other_listings=())         # the gate's momenta are the TARGET leg only (no fan-out)
+    vm = _vol_momentum_vec(raw_data, shared_data, tgt_only, spans)[target_ex]
+    rm = _rate_momentum_vec(raw_data, shared_data, tgt_only, spans)[target_ex]
     ctx.base = [ctx.sample_to_anchor(rm), ctx.sample_to_anchor(vm)]   # [rate_momentum, vol_momentum]
     finite = np.isfinite(ctx.vol_level)
     ctx.vol_regime = np.digitize(ctx.vol_level, np.nanpercentile(ctx.vol_level[finite], [33, 67]))
@@ -556,9 +557,10 @@ def best_span(
     score_magnitude: bool = False,
     mirror=None,
 ) -> Params:
-    """In-sample span pick: the `params` maximising the mean (over legs) rank-IC against `target`
-    (`|leg|` when `score_magnitude`). Used only to give a feature its best shot at the gate — span
-    SELECTION proper is a later step, not screening.
+    """In-sample span pick: the `params` maximising the mean (over legs) **|rank-IC|** against `target`
+    (`|leg|` when `score_magnitude`). The pick is SIGN-BLIND on purpose — a strongly NEGATIVE rank-IC is
+    real (inverted) signal the model learns the sign of, so a span at IC -0.25 beats one at +0.05. Used
+    only to give a feature its best shot at the gate — span SELECTION proper is a later step, not screening.
 
     `mirror` (a feature reflection callable, e.g. `FeatureSpec.mirror`) mirror-augments the SIGNED pick —
     `ic(concat[leg, mirror(leg)], concat[target, -target])` — so the pick is direction-free. Ignored when
@@ -574,7 +576,7 @@ def best_span(
 
     best, best_score = None, -np.inf
     for p, legs in family.items():
-        s = float(np.nanmean([_ic(v) for v in legs.values()]))
+        s = float(np.nanmean([abs(_ic(v)) for v in legs.values()]))   # |IC| per leg -> strongest signal, any sign
         if np.isfinite(s) and s > best_score:
             best, best_score = p, s
     return best

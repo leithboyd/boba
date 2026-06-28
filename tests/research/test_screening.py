@@ -202,18 +202,20 @@ def test_headconfig_factories():
 # --------------------------------------------------------------------------------------------------
 # small shared diagnostics — span pick + echo-netting
 # --------------------------------------------------------------------------------------------------
-def test_best_span_picks_max_ic():
+def test_best_span_picks_max_abs_ic():
+    """The span pick is SIGN-BLIND (max |IC|): a strongly NEGATIVE IC (real inverted signal the model learns
+    the sign of) beats a weakly positive one."""
     from boba.research.screening import best_span
     rng = np.random.default_rng(1)
     n = 5000
     target = rng.standard_normal(n)
     ctx, _, _ = _gate_ctx(n=n)
     family = {
-        (1, 1): {"aaa": rng.standard_normal(n)},                       # noise
-        (2, 2): {"aaa": target * 0.5 + rng.standard_normal(n)},        # strong
-        (3, 3): {"aaa": target * 0.1 + rng.standard_normal(n)},        # weak
+        (1, 1): {"aaa": rng.standard_normal(n)},                       # noise -> |IC| ~ 0
+        (2, 2): {"aaa": -target * 0.5 + rng.standard_normal(n)},       # strong NEGATIVE corr -> large |IC|
+        (3, 3): {"aaa": target * 0.1 + rng.standard_normal(n)},        # weak positive corr -> small |IC|
     }
-    assert best_span(ctx, family, target) == (2, 2)
+    assert best_span(ctx, family, target) == (2, 2)                    # picked by |IC|, despite the negative sign
 
 
 def test_echo_netted_ic_real_vs_echo():

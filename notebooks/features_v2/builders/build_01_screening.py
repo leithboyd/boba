@@ -107,13 +107,13 @@ GRID = ([(nf, ns) for nf in (1, 10, 50, 200, 500, 1000)
         if IS_2D else sorted([1, 10, 50, 100, 500, 1000, 2000, 5000, 10000]))    # single-span family (SINGLE)
 family = build_family(ctx, spec.vectorized, GRID, n_jobs=18)
 
-# price-head TARGET: the fixed-move-count with the strongest signed IC (leg-averaged best span, mirror-
-# augmented) — the same choice as 02. NO 100 ms wall-clock target: we screen against the per-move direction.
+# price-head TARGET: the fixed-move-count with the strongest signed IC IN MAGNITUDE (leg-averaged best |IC|
+# span, mirror-augmented — sign-blind, the model learns the sign) — same choice as 02. NO 100 ms target.
 fmt = fixed_move_targets(ctx, COUNTS)
 def _peak_ic(target):
     res = (ic_grid if IS_2D else ic_scan)(ctx, family, target, n_jobs=18, mirror=spec.mirror)
-    return float(np.nanmean([np.nanmax(res[leg]) for leg in KEYS]))
-best_n = max(COUNTS, key=lambda n: _peak_ic(fmt[n]))                           # the strongest move-count horizon
+    return float(np.nanmean([np.nanmax(np.abs(res[leg])) for leg in KEYS]))    # |IC|: sign-blind
+best_n = max(COUNTS, key=lambda n: _peak_ic(fmt[n]))                           # the strongest (|IC|) move-count horizon
 price_target = fmt[best_n]                                                     # count-conditioned price-head target
 
 price_span = best_span(ctx, family, price_target, mirror=spec.mirror)          # signed feature -> n-move return

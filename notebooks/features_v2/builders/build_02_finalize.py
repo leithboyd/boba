@@ -91,11 +91,18 @@ def ic_breakdown(target, magnitude=False, mirror=None):    # 2-D grid (ic_grid) 
 def show_breakdown(res, title):
     (show_grids if IS_2D else show_scan)(res, title)
 
-def best_param(res, leg):                                  # (param token, IC) at this leg's in-sample argmax
+def _peak(res, leg, neg=False):                            # (param token, IC) at this leg's strongest +IC (or -IC if neg)
     a = res[leg]
+    if not np.isfinite(a).any():
+        return None, float("nan")
+    idx = int(np.nanargmin(a)) if neg else int(np.nanargmax(a))
     if IS_2D:
-        i, j = np.unravel_index(np.nanargmax(a), a.shape); return (FAST[i], SLOW[j]), float(a[i, j])
-    i = int(np.nanargmax(a)); return SPANS[i], float(a[i])
+        i, j = np.unravel_index(idx, a.shape); return (FAST[i], SLOW[j]), float(a[i, j])
+    return SPANS[idx], float(a[idx])
+
+def best_param(res, leg):                                  # the leg's PICK: strongest |IC|, any sign (the model learns it)
+    (sp, ic), (sn, icn) = _peak(res, leg), _peak(res, leg, neg=True)
+    return (sn, icn) if abs(icn) > abs(ic) else (sp, ic)
 """)
 
 md(r"""
@@ -131,9 +138,10 @@ show_breakdown(rate_res, "rate head: |feature| -> move count")               # .
 """)
 
 code(r"""
-# best span PER LEG per diagnostic — each leg's OWN in-sample argmax (no leg is privileged; a representative
-# scale, not an OOS claim). One row per diagnostic; span + its rank-IC per leg. The legs are the feature's
-# own keys (`spec.keys_for`) and the span is its param token, so this works for any feature and param_kind.
+# best span PER LEG per diagnostic — for each leg, the strongest POSITIVE and strongest NEGATIVE in-sample IC
+# (each with its span, as `IC @ span`). A strong -IC is real (inverted) signal the model learns the sign of,
+# so the actual span PICK (cell below, `best_span`) is SIGN-BLIND (max |IC|); both signs are shown here so a
+# sign-flip across scales is visible. Legs are the feature's own keys, the span its param token (any kind).
 diagnostics = ([(f"price n={n} signed",    signed[n]) for n in fmt]
              + [(f"price n={n} |feature|", magnit[n]) for n in fmt]
              + [("rate |feature|->count",  rate_res)])
@@ -141,24 +149,25 @@ rows = []
 for name, res in diagnostics:
     row = {"diagnostic": name}
     for leg in KEYS:
-        span, icv = best_param(res, leg)
-        row[f"{leg} span"] = str(span); row[f"{leg} IC"] = round(icv, 3)
+        (sp, ic), (sn, icn) = _peak(res, leg), _peak(res, leg, neg=True)
+        row[f"{leg} +IC"] = f"{ic:+.3f} @ {sp}"
+        row[f"{leg} -IC"] = f"{icn:+.3f} @ {sn}"
     rows.append(row)
 pl.DataFrame(rows)
 """)
 
 code(r"""
-# Pick the price-head TARGET from the §1 sweep itself: the fixed-move-count whose signed IC is strongest
-# (leg-averaged, at each count's best span). Then use THAT count-conditioned target for the span pick and
-# §3 below — NO 100 ms wall-clock target anywhere, so the whole notebook is consistent with the §1 breakdown.
-def _peak_ic(res):                                          # a breakdown's leg-averaged best-span IC
-    return float(np.nanmean([np.nanmax(res[leg]) for leg in KEYS]))
-best_n = max(fmt, key=lambda n: _peak_ic(signed[n]))        # the strongest move-count horizon (price_dislocation: n=5)
+# Pick the price-head TARGET from the §1 sweep itself: the fixed-move-count whose signed IC is strongest IN
+# MAGNITUDE (leg-averaged, at each count's best |IC| span — sign-blind, since the model learns the sign).
+# Then use THAT count-conditioned target for the span pick and §3 — NO 100 ms wall-clock target anywhere.
+def _peak_ic(res):                                          # a breakdown's leg-averaged best-span |IC|
+    return float(np.nanmean([np.nanmax(np.abs(res[leg])) for leg in KEYS]))
+best_n = max(fmt, key=lambda n: _peak_ic(signed[n]))        # the strongest (|IC|) move-count horizon
 price_target = fmt[best_n]                                  # the count-conditioned price-head target (mirror-augmented below)
 
-price_span = best_span(ctx, family, price_target, mirror=spec.mirror)   # span maximising mean rank-IC over the legs
+price_span = best_span(ctx, family, price_target, mirror=spec.mirror)   # span maximising mean |rank-IC| over the legs
 rate_span  = best_span(ctx, family, ctx.rate_target, score_magnitude=True)
-print(f"price head: best move-count n={best_n} (peak IC {_peak_ic(signed[best_n]):+.3f})   span {price_span}")
+print(f"price head: best move-count n={best_n} (peak |IC| {_peak_ic(signed[best_n]):.3f})   span {price_span}")
 print(f"rate head:  span {rate_span}   (rate target = move count, not a price target)")
 """)
 
